@@ -1,0 +1,3 @@
+# Standalone Neural Network Engine dependencies for Northh Dhruva (BHARAT-LLM)
+# Zero external NLP, tokenizer, or Hugging Face dependencies.
+torch>=2.0.0

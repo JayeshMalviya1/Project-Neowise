@@ -1,0 +1,35 @@
+# Northh Dhruva (Project BHARAT-LLM) Pretraining Configuration
+# 100M Architecture optimized for local 24GB GPU execution
+
+model:
+  vocab_size: 380            # 380 for local/debug runs; set to 64000 for full-scale Indic pretraining
+  dim: 640                   # Model hidden dimension
+  n_layers: 12               # Number of Transformer layers
+  n_heads: 10                # Number of Query attention heads
+  n_kv_heads: 2              # Grouped-Query Attention (5:1 ratio)
+  intermediate_size: 1792    # SwiGLU hidden dimension (multiple of 128)
+  max_seq_len: 256           # Pretraining sequence context length
+  rope_theta: 500000.0       # RoPE base frequency
+  rms_norm_eps: 1.0e-5       # RMSNorm epsilon
+  tie_word_embeddings: true  # Tie lm_head weights to input token embeddings
+  initializer_range: 0.02    # Gaussian standard deviation for weight init
+
+training:
+  micro_batch_size: 8        # Per-device batch size per step
+  seq_len: 256               # Context sequence length
+  grad_accum_steps: 4        # Effective batch size = 8 * 4 * 256 = 8,192 tokens/step
+  max_steps: 500             # Total training iterations
+  max_lr: 6.0e-4             # Peak learning rate
+  min_lr: 6.0e-5             # Minimum / final learning rate (10% of peak)
+  warmup_steps: 50           # Linear warmup iterations (10% of total)
+  weight_decay: 0.1          # Decoupled AdamW weight decay
+  grad_clip: 1.0             # Maximum gradient norm threshold
+  checkpoint_dir: "./checkpoints/dhruva_100m"
+  save_interval: 100         # Checkpoint saving frequency
+  log_interval: 10           # Terminal loss logging frequency
+
+data:
+  train_bin_path: "./data/train_shard.bin"
+  val_bin_path: null
+  tokenizer_dir: "./data/tokenizer"
+

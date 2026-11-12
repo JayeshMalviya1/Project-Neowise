@@ -1,0 +1,37 @@
+# Northh Dhruva (Project BHARAT-LLM) Apple Silicon M1 Pro (MPS) Configuration
+# Designed for 100M-token pretraining in Unified Memory without OOM or MPS crashes
+
+model:
+  vocab_size: 16384           # Scaled 16K Byte-Level BPE vocabulary
+  dim: 512                    # Model hidden dimension
+  n_layers: 8                 # Number of Transformer decoder blocks
+  n_heads: 8                  # Query attention heads
+  n_kv_heads: 2               # Grouped-Query Attention (4:1 ratio)
+  intermediate_size: 1408     # SwiGLU hidden dimension (multiple of 128)
+  max_seq_len: 512            # Context sequence length for MPS unified memory
+  rope_theta: 500000.0        # RoPE base frequency
+  rms_norm_eps: 1.0e-5        # RMSNorm numerical stability epsilon
+  tie_word_embeddings: true   # Weight-tied input embeddings and LM head
+  initializer_range: 0.02     # Standard normal initialization std
+
+training:
+  micro_batch_size: 4         # Per-step micro-batch size
+  seq_len: 512                # Training sequence length
+  grad_accum_steps: 16        # Effective batch = 4 * 16 * 512 = 32,768 tokens/step
+  max_steps: 3052             # 3,052 * 32,768 ≈ 100,007,936 tokens (100M tokens)
+  max_lr: 6.0e-4              # Peak cosine learning rate
+  min_lr: 6.0e-5              # Final cosine learning rate
+  warmup_steps: 150           # Linear warmup iterations
+  weight_decay: 0.1           # Decoupled AdamW weight decay
+  grad_clip: 1.0              # Gradient L2 norm clipping threshold
+  dtype: "float16"            # Target precision on Apple Silicon MPS
+  checkpoint_dir: "./checkpoints/dhruva_m1_pro_100m"
+  save_interval: 200          # Checkpoint saving & MPS cache flush frequency
+  log_interval: 10            # Console logging interval
+  eval_interval: 200          # Validation perplexity evaluation interval
+
+data:
+  train_shards_dir: "./data/shards/train"
+  val_shards_dir: "./data/shards/val"
+  tokenizer_dir: "./data/tokenizer_16k"
+

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/checkpoints/
+/data/
+northh-dhruva/checkpoints/
+northh-dhruva/data/
