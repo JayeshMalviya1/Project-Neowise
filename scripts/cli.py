@@ -18,7 +18,15 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import torch
+# Auto re-exec into local .venv if torch is not in current environment
+try:
+    import torch
+except ImportError:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    venv_python = os.path.join(project_root, ".venv", "bin", "python")
+    if os.path.isfile(venv_python) and sys.executable != venv_python:
+        os.execv(venv_python, [venv_python] + sys.argv)
+    raise
 
 # Ensure project root is in sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
