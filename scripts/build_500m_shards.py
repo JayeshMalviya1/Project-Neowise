@@ -393,7 +393,9 @@ def parse_args() -> argparse.Namespace:
         help="Target Byte-Level BPE vocabulary size (default: 32768)",
     )
     parser.add_argument(
+        "--output_dir",
         "--tokenizer_dir",
+        dest="tokenizer_dir",
         type=str,
         default="data/tokenizer_32k",
         help="Directory to save or load 32K tokenizer (default: data/tokenizer_32k)",
