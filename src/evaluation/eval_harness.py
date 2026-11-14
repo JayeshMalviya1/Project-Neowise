@@ -192,3 +192,57 @@ def generate_text(
 
     generated_ids = curr_tokens[0].tolist()
     return tokenizer.decode(generated_ids)
+
+
+def stream_generate_tokens(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt: str,
+    max_new_tokens: int = 100,
+    temperature: float = 0.7,
+    top_k: int = 40,
+    top_p: float = 0.9,
+    device: Union[str, torch.device] = "cpu",
+):
+    """Yields generated text chunks in real-time as each token is sampled."""
+    dev = torch.device(device)
+    model.eval()
+    model.to(dev)
+
+    token_ids = tokenizer.encode(prompt)
+    if not token_ids:
+        token_ids = [getattr(tokenizer, "bos_token_id", 1)]
+
+    eos_id = getattr(tokenizer, "eos_token_id", 2)
+    curr_tokens = torch.tensor([token_ids], dtype=torch.long, device=dev)
+
+    prev_text = tokenizer.decode(curr_tokens[0].tolist())
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            if hasattr(model, "config") and hasattr(model.config, "max_seq_len"):
+                max_len = model.config.max_seq_len
+                input_tokens = curr_tokens[:, -max_len:]
+            else:
+                input_tokens = curr_tokens
+
+            outputs = model(input_tokens)
+            next_logits = outputs["logits"][0, -1, :]
+            next_tid = sample_tokens(
+                next_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
+            if next_tid == eos_id:
+                break
+
+            next_tensor = torch.tensor([[next_tid]], dtype=torch.long, device=dev)
+            curr_tokens = torch.cat([curr_tokens, next_tensor], dim=1)
+
+            curr_text = tokenizer.decode(curr_tokens[0].tolist())
+            delta = curr_text[len(prev_text):]
+            prev_text = curr_text
+            if delta:
+                yield delta

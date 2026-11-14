@@ -6,4 +6,5 @@ __pycache__/
 /data/
 northh-dhruva/checkpoints/
 northh-dhruva/data/
+checkpoints_100m/
 *.zip
