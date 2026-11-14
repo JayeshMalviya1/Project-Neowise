@@ -248,6 +248,7 @@ def run_local_pretrain() -> None:
         rms_norm_eps=float(model_cfg.get("rms_norm_eps", 1e-5)),
         tie_word_embeddings=bool(model_cfg.get("tie_word_embeddings", True)),
         initializer_range=float(model_cfg.get("initializer_range", 0.02)),
+        use_checkpoint=bool(model_cfg.get("use_checkpoint", False)),
     )
     model = DhruvaForCausalLM(dhruva_config)
 

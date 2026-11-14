@@ -1,0 +1,37 @@
+# Northh Dhruva (Project BHARAT-LLM) 500M Foundation Model Configuration
+# Indigenous multilingual foundation model for large-scale distributed pretraining
+
+model:
+  vocab_size: 32768           # Scaled 32K Byte-Level BPE vocabulary
+  dim: 1280                   # Model hidden dimension
+  n_layers: 24                # Transformer decoder blocks
+  n_heads: 16                 # Query attention heads (head_dim = 80)
+  n_kv_heads: 4               # Grouped-Query Attention (4:1 ratio)
+  intermediate_size: 3584     # SwiGLU hidden dimension (multiple of 128)
+  max_seq_len: 2048           # Training context window
+  rope_theta: 500000.0        # RoPE base frequency
+  rms_norm_eps: 1.0e-5        # RMSNorm epsilon
+  tie_word_embeddings: true   # Weight-tied embeddings and LM head
+  initializer_range: 0.02     # Parameter initialization std
+  use_checkpoint: false       # Activation gradient checkpointing
+
+training:
+  micro_batch_size: 16        # Micro-batch per device (16 * 2048 = 32,768 tokens)
+  seq_len: 2048               # Sequence length
+  grad_accum_steps: 16        # Effective batch = 16 * 16 * 2048 = 524,288 tokens/step
+  max_steps: 10000            # 10,000 steps * 524,288 tokens/step ≈ 5,242,880,000 tokens (~5.24B)
+  max_lr: 3.0e-4              # Peak cosine learning rate
+  min_lr: 3.0e-5              # Final cosine learning rate
+  warmup_steps: 500           # Linear warmup iterations
+  weight_decay: 0.1           # Decoupled AdamW weight decay
+  grad_clip: 1.0              # Gradient L2 norm clipping threshold
+  dtype: "bfloat16"           # Target precision for A100 / H100 / Ampere+ GPUs
+  checkpoint_dir: "./checkpoints/dhruva_500m_base"
+  eval_interval: 500          # Validation perplexity evaluation interval
+  save_interval: 1000         # Checkpoint saving frequency
+  log_interval: 10            # Console logging interval
+
+data:
+  train_shards_dir: "./data/shards_500m/train"
+  val_shards_dir: "./data/shards_500m/val"
+  tokenizer_dir: "./data/tokenizer_32k"

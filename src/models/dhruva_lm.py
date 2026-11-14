@@ -3,6 +3,7 @@ from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from configs.model_config import DhruvaConfig
 from src.models.normalization import RMSNorm
@@ -107,7 +108,10 @@ class DhruvaForCausalLM(nn.Module):
         x = self.tok_embeddings(input_ids)
 
         for layer in self.layers:
-            x = layer(x)
+            if self.training and getattr(self.config, "use_checkpoint", False):
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
 
         x = self.norm(x)
         logits = self.lm_head(x)
@@ -194,4 +198,15 @@ class DhruvaForCausalLM(nn.Module):
             "transformer_body_parameters": body_params,
             "actual_total_parameters": actual_total,
             "actual_transformer_body_parameters": actual_body,
+        }
+
+    def count_parameters(self) -> Dict[str, int]:
+        """Returns exact total and non-embedding parameter counts accounting for weight tying."""
+        total_params = sum(p.numel() for p in self.parameters())
+        emb_params = self.tok_embeddings.weight.numel()
+        non_emb_params = total_params - emb_params
+        return {
+            "total": total_params,
+            "non_embedding": non_emb_params,
+            "embedding": emb_params,
         }

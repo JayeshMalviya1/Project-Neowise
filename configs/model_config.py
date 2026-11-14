@@ -20,6 +20,7 @@ class DhruvaConfig:
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = True
     initializer_range: float = 0.02
+    use_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         assert (
