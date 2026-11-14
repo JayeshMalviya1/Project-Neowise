@@ -1,0 +1,37 @@
+# Northh Dhruva (Project BHARAT-LLM) NVIDIA Tesla T4 (Colab) Configuration
+# Optimized for 100M-token pretraining on Tesla T4 (15GB VRAM, Turing Tensor Cores)
+
+model:
+  vocab_size: 16384           # Scaled 16K Byte-Level BPE vocabulary
+  dim: 512                    # Model hidden dimension
+  n_layers: 8                 # Number of Transformer decoder blocks
+  n_heads: 8                  # Query attention heads
+  n_kv_heads: 2               # Grouped-Query Attention (4:1 ratio)
+  intermediate_size: 1408     # SwiGLU hidden dimension (multiple of 128)
+  max_seq_len: 1024           # Context sequence length
+  rope_theta: 500000.0        # RoPE base frequency
+  rms_norm_eps: 1.0e-5        # RMSNorm numerical stability epsilon
+  tie_word_embeddings: true   # Weight-tied input embeddings and LM head
+  initializer_range: 0.02     # Standard normal initialization std
+
+training:
+  micro_batch_size: 8         # Micro-batch size per step (8 * 1024 tokens = 8,192 tokens)
+  seq_len: 1024               # Training sequence length
+  grad_accum_steps: 8         # Effective batch: 8 * 8 * 1024 = 65,536 tokens/step
+  max_steps: 1526             # 1,526 steps * 65,536 tokens/step ≈ 100,007,936 tokens (100M tokens)
+  max_lr: 6.0e-4              # Peak cosine learning rate
+  min_lr: 6.0e-5              # Final cosine learning rate
+  warmup_steps: 100           # Linear warmup iterations
+  weight_decay: 0.1           # Decoupled AdamW weight decay
+  grad_clip: 1.0              # Gradient L2 norm clipping threshold
+  dtype: "float16"            # Mandatory for Tesla T4 Turing Tensor Cores (no native bfloat16)
+  checkpoint_dir: "./checkpoints/dhruva_t4_100m"
+  save_interval: 200          # Checkpoint saving & validation eval frequency
+  log_interval: 10            # Console logging interval
+  eval_interval: 200          # Validation perplexity evaluation interval
+
+data:
+  train_shards_dir: "./data/shards/train"
+  val_shards_dir: "./data/shards/val"
+  tokenizer_dir: "./data/tokenizer_16k"
+
