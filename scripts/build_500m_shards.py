@@ -80,8 +80,8 @@ def stream_hindi_dataset() -> Iterator[str]:
     from datasets import load_dataset
 
     candidates = [
-        ("ai4bharat/sangraha", {"name": "verified", "split": "hi", "streaming": True}),
-        ("ai4bharat/sangraha", {"name": "verified", "data_dir": "verified/hi", "split": "train", "streaming": True}),
+        ("ai4bharat/sangraha", {"name": "verified", "split": "hin", "streaming": True}),
+        ("ai4bharat/sangraha", {"name": "verified", "data_dir": "verified/hin", "split": "train", "streaming": True}),
         ("wikimedia/wikipedia", {"name": "20231101.hi", "split": "train", "streaming": True}),
     ]
 
