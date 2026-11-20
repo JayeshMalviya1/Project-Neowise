@@ -7,16 +7,17 @@ spanning 8 everyday industries (HR, Software/API, Finance/Invoices, Legal/Contra
 Healthcare/Labs, E-commerce/Product Specs, Education/Academics, Operations/Logistics)
 in both English and Hindi/Hinglish.
 
-Balanced 2,380-pair mix (epochs=3, lr=2e-5, batch=2, grad_accum=8 -> ~447 steps):
-  1. Procedural Domain-Agnostic RAFT Q&A (1,400 pairs): Dynamically randomized entities,
+Balanced 2,500-pair mix (epochs=2, lr=1e-5, batch=2, grad_accum=8 -> ~313 steps):
+  1. Procedural Domain-Agnostic RAFT Q&A (1,500 pairs): Dynamically randomized entities,
      numbers, dates, percentages, filenames, and page numbers (1..60) with 1 Oracle +
      2-3 cross-domain Distractors and exact inline `[Doc: {doc} | Page {page}]` citations.
-  2. Clean Domain-Agnostic Abstention (180 pairs): Unanswerable English/Hindi questions
-     across all 8 domains with 3 unrelated Distractors, clean period ending, ZERO `[Doc: ...]`.
-  3. Natural Bilingual Greetings & General Chat (300 pairs): 100% standalone English, Hindi
-     & Hinglish greetings/identity turns (runtime `best_cosine < 0.38` gate handles bypass).
-  4. Domain-Agnostic JSON Replay (500 pairs): Dynamic multi-domain `table` (with explicit
-     target column hints in every instruction) and `specs_card` replay.
+  2. Abstention Offloaded to BAAI/bge-m3 Gate (`n_abstain=0` by default): Prevents
+     trigger-happy false refusals on grounded chunks; handled by the 3-tier similarity
+     gate in `src/rag/pipeline.py`.
+  3. Natural Bilingual Greetings & General Chat (250 pairs): 100% standalone English, Hindi
+     & Hinglish greetings/identity turns.
+  4. Strong Multi-Domain JSON Replay (750 pairs): Dynamic `type: "table"` (including
+     `Invoice, Customer, Amount, Status` invoice tables) and `type: "specs_card"` schemas.
 """
 
 import argparse
@@ -586,19 +587,19 @@ def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
         inst = "Extract the employee leave roster into a JSON table with columns: Employee, Department, Leave Balance, Status."
         obj = {"type": "table", "columns": ["Employee", "Department", "Leave Balance", "Status"], "rows": rows}
     elif kind == 1:
-        # Invoice Line Items Table
-        items = ["Cloud GPU Hours", "API Enterprise License", "SSL Wildcard Cert", "Managed PostgreSQL", "Data Backup Storage", "Onboarding Support"]
-        picked = rng.sample(items, k=num_rows)
+        # Invoice Records Table (`Invoice, Customer, Amount, Status`)
+        statuses = ["Paid", "Pending", "Overdue", "Approved", "In Review"]
+        customers = rng.sample(COMPANIES, k=num_rows)
         lines, rows = [], []
-        for idx, item in enumerate(picked, 1):
-            qty = rng.randint(1, 20)
-            unit = rng.randrange(500, 15000, 500)
-            total = qty * unit
-            lines.append(f"{idx}. Item: {item}, Quantity: {qty}, Unit Price: Rs {unit}, Total: Rs {total}")
-            rows.append([item, str(qty), f"Rs {unit}", f"Rs {total}"])
-        ctx = f"Invoice #{rng.randint(1000, 9999)} Summary:\n" + "\n".join(lines)
-        inst = "Extract the invoice line items into a JSON table with columns: Item, Quantity, Unit Price, Total."
-        obj = {"type": "table", "columns": ["Item", "Quantity", "Unit Price", "Total"], "rows": rows}
+        for idx, cust in enumerate(customers, 1):
+            inv_id = f"INV-{rng.randint(1000, 9999)}"
+            amt = f"Rs {rng.randrange(5000, 250000, 500):,}"
+            st = rng.choice(statuses)
+            lines.append(f"{idx}. Invoice: {inv_id}, Customer: {cust}, Amount: {amt}, Status: {st}")
+            rows.append([inv_id, cust, amt, st])
+        ctx = f"Quarterly Billing Ledger ({rng.choice(['Q1', 'Q2', 'Q3', 'Q4'])} 2026):\n" + "\n".join(lines)
+        inst = "Extract the invoice records into a JSON table with columns: Invoice, Customer, Amount, Status."
+        obj = {"type": "table", "columns": ["Invoice", "Customer", "Amount", "Status"], "rows": rows}
     elif kind == 2:
         # Student Grades Table
         courses = ["Machine Learning", "Database Systems", "Operating Systems", "Linear Algebra", "Data Structures", "Cloud Computing"]
@@ -705,13 +706,13 @@ def _format_chunks(chunks: List[Tuple[str, int, str]]) -> str:
 
 
 def build_stage4_dataset(
-    n_raft: int = 1400,
-    n_abstain: int = 180,
-    n_greet: int = 300,
-    n_json: int = 500,
+    n_raft: int = 1500,
+    n_abstain: int = 0,
+    n_greet: int = 250,
+    n_json: int = 750,
     seed: int = 42,
 ) -> List[Tuple[str, str]]:
-    """Builds the balanced 2,380-pair domain-agnostic Stage 4 dataset."""
+    """Builds the balanced 2,500-pair domain-agnostic Stage 4 dataset (abstention offloaded to RAG gate)."""
     rng = random.Random(seed)
     dataset: List[Tuple[str, str]] = []
 
@@ -992,19 +993,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", type=str, default=DEFAULT_STAGE3_CKPT, help="Path to Stage 3 checkpoint")
     parser.add_argument("--output", type=str, default="dhruva_500m_raft_final.pt", help="Output Stage 4 checkpoint path")
     parser.add_argument("--tokenizer_dir", type=str, default="data/tokenizer_32k", help="32K ByteBPETokenizer directory")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of fine-tuning epochs (default: 3)")
+    parser.add_argument("--epochs", type=int, default=2, help="Number of fine-tuning epochs (default: 2)")
     parser.add_argument("--batch_size", type=int, default=2, help="Micro-batch size per step")
     parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=2.0e-5, help="Peak AdamW learning rate (default: 2e-5)")
+    parser.add_argument("--lr", type=float, default=1.0e-5, help="Peak AdamW learning rate (default: 1e-5)")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient norm clipping threshold")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Max training sequence length")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable activation gradient checkpointing")
     parser.add_argument("--log_interval", type=int, default=10, help="Logging interval in optimizer steps")
-    parser.add_argument("--n_raft", type=int, default=1400, help="Procedural RAFT pairs across 8 domains (default: 1400)")
-    parser.add_argument("--n_abstain", type=int, default=180, help="Clean domain-agnostic abstention pairs (default: 180)")
-    parser.add_argument("--n_greet", type=int, default=300, help="Standalone bilingual greeting/Hinglish pairs (default: 300)")
-    parser.add_argument("--n_json", type=int, default=500, help="Multi-domain JSON replay pairs (default: 500)")
+    parser.add_argument("--n_raft", type=int, default=1500, help="Procedural RAFT pairs across 8 domains (default: 1500)")
+    parser.add_argument("--n_abstain", type=int, default=0, help="Abstention pairs (default: 0; handled by BGE-M3 gate)")
+    parser.add_argument("--n_greet", type=int, default=250, help="Standalone bilingual greeting/Hinglish pairs (default: 250)")
+    parser.add_argument("--n_json", type=int, default=750, help="Multi-domain JSON replay pairs (default: 750)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--dry_run", action="store_true", help="Build and validate dataset without training")
     return parser.parse_args()

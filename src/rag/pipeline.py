@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,7 @@ class DhruvaRAGPipeline:
         chunk_tokens: int = 280,
         chunk_overlap: int = 40,
         similarity_threshold: float = 0.38,
+        abstain_threshold: float = 0.48,
         database_url: Optional[str] = None,
     ) -> None:
         self.engine = engine
@@ -64,6 +66,7 @@ class DhruvaRAGPipeline:
         self.chunk_tokens = chunk_tokens
         self.chunk_overlap = chunk_overlap
         self.similarity_threshold = similarity_threshold
+        self.abstain_threshold = abstain_threshold
         self.database_url = database_url or os.environ.get("DATABASE_URL")
 
         default_index = Path.home() / ".dhruva" / "rag_index.json"
@@ -317,18 +320,32 @@ class DhruvaRAGPipeline:
         output_mode: str = "auto",
         temperature: float = 0.0,
         similarity_threshold: Optional[float] = None,
+        abstain_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Runs similarity-gated RAG query with automatic conversational fallback."""
-        threshold = (
+        """Runs 3-tier similarity-gated RAG query:
+        - Tier 1 (`not hits` or `best_cosine < 0.38`): `conversational_fallback` (no chunks).
+        - Tier 2 (`0.38 <= best_cosine < 0.48` and `output_mode == "auto"`): `rag_abstain`
+          (returns clean abstention directly without invoking the LLM on weak chunks).
+        - Tier 3 (`best_cosine >= 0.48`): `rag_grounded` (packs top chunks for cited synthesis).
+        """
+        t0 = time.perf_counter()
+        conv_thresh = (
             self.similarity_threshold
             if similarity_threshold is None
             else float(similarity_threshold)
         )
+        abs_thresh = (
+            self.abstain_threshold
+            if abstain_threshold is None
+            else float(abstain_threshold)
+        )
+
         hits = self.hybrid_retrieve(question, top_k=top_k)
         best_cosine = max((h.cosine_score for h in hits), default=0.0)
+        mode_norm = (output_mode or "auto").lower()
 
-        # Smart Conversational & Abstention Gate
-        if not hits or best_cosine < threshold:
+        # Tier 1: Conversational Fallback (greetings / general chat unrelated to indexed docs)
+        if not hits or best_cosine < conv_thresh:
             res = self.engine.generate(
                 prompt=question,
                 context=None,
@@ -340,7 +357,27 @@ class DhruvaRAGPipeline:
             res["sources"] = []
             return res
 
-        # Pack top chunks within Dhruva's token budget: context_window - max_new_tokens - 96
+        # Tier 2: Similarity-Gated Abstention Band (0.38 <= best_cosine < 0.48 in auto mode)
+        if mode_norm == "auto" and best_cosine < abs_thresh:
+            has_devanagari = any("\u0900" <= ch <= "\u097F" for ch in question)
+            if has_devanagari:
+                abstain_msg = "क्षमा करें, उपलब्ध दस्तावेजों में इस प्रश्न का सटीक उत्तर नहीं मिला."
+            else:
+                abstain_msg = "I am sorry, the provided documents do not contain enough relevant information to answer this question."
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return {
+                "format": "text",
+                "ui_component": "markdown",
+                "data": abstain_msg,
+                "raw": abstain_msg,
+                "tokens_generated": 0,
+                "latency_ms": latency_ms,
+                "mode": "rag_abstain",
+                "best_cosine": round(best_cosine, 4),
+                "sources": [],
+            }
+
+        # Tier 3: Grounded Cited Synthesis (best_cosine >= 0.48 or explicit structured JSON mode)
         token_budget = max(128, self.engine.context_window - max_new_tokens - 96)
         question_tokens = len(self.engine.tokenizer.encode(question))
         remaining_budget = max(64, token_budget - question_tokens)
@@ -360,7 +397,6 @@ class DhruvaRAGPipeline:
 
         packed_context = "\n\n".join(packed_blocks)
 
-        mode_norm = (output_mode or "auto").lower()
         if mode_norm == "table":
             res = self.engine.generate(
                 prompt=f"{question}\nExtract the information into a structured JSON table.",
