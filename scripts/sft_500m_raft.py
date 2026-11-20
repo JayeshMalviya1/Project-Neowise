@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Stage 4 RAFT (Retrieval-Augmented Fine-Tuning) + Conversational Fallback Trainer
-for Northh Dhruva 500M (Project BHARAT-LLM).
+"""Stage 4 Domain-Agnostic RAFT (Retrieval-Augmented Fine-Tuning) + Conversational Fallback
+Trainer for Northh Dhruva 500M (Project BHARAT-LLM).
 
-Fine-tunes from the Stage 3 checkpoint (`dhruva_500m_instruct_json.pt`) and saves
-`dhruva_500m_raft_final.pt` using our exact ChatML template:
-    ### User:\n{prompt}\n\n### Assistant:\n
-with user prompt tokens masked to `-100`.
+Trains Dhruva-500M as a general-purpose, domain-agnostic RAG + structured JSON model
+spanning 8 everyday industries (HR, Software/API, Finance/Invoices, Legal/Contracts,
+Healthcare/Labs, E-commerce/Product Specs, Education/Academics, Operations/Logistics)
+in both English and Hindi/Hinglish.
 
-Balanced 3,100-pair training mix:
-  1. Grounded Multi-Chunk RAFT Q&A (~1,600 pairs) with 1 Oracle + 3 Distractor chunks
-     and inline source citations `[Doc: {doc} | Page {page}]`.
-  2. Strict Abstention on Missing Facts (~450 pairs) with 3 Distractor chunks (0 Oracle).
-  3. Greeting & General Conversation Bypass (~600 pairs; 50% wrapped in noisy Retrieved Context,
-     50% standalone chat turns across English & Hindi).
-  4. Structured JSON Replay Buffer (~450 pairs) preserving Stage 3 `table` & `specs_card` JSON.
+Anti-overfitting 2,300-pair mix (epochs=1, lr=1e-5, batch=2, grad_accum=8 -> ~144 steps):
+  1. Procedural Domain-Agnostic RAFT Q&A (~1,200 pairs): Dynamically randomized entities,
+     numbers, dates, percentages, filenames, and page numbers (1..60) with 1 Oracle +
+     2-3 cross-domain Distractors and exact inline `[Doc: {doc} | Page {page}]` citations.
+  2. Clean Domain-Agnostic Abstention (~350 pairs): Unanswerable English/Hindi questions
+     across all 8 domains with 3 unrelated Distractors, clean period ending, ZERO `[Doc: ...]`.
+  3. Natural Bilingual Greetings & General Chat (~350 pairs): English, Hindi & Hinglish
+     greetings/identity turns (50% wrapped in noisy Retrieved Context, 50% standalone).
+  4. Domain-Agnostic JSON Replay (~400 pairs): Dynamic multi-domain `table` (employees,
+     invoices, student grades, order logs) and `specs_card` (laptops, cloud servers,
+     SaaS plans, home appliances).
 """
 
 import argparse
@@ -25,7 +29,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -47,465 +51,726 @@ DEFAULT_STAGE3_CKPT = "/content/drive/MyDrive/Project_dhurva/instruct_500m/dhruv
 
 
 # =============================================================================
-# 1. Domain Knowledge Bank (English & Hindi Policy / Engineering Facts)
+# 1. Procedural Domain-Agnostic RAFT Generators (8 Everyday Industries)
 # =============================================================================
 
-ORACLE_FACTS: List[Dict[str, str]] = [
-    # --- FRA 2006 IFR / CFR Rules (English & Hindi) ---
-    {
-        "doc": "FRA_2006_Act.pdf",
-        "page": "4",
-        "text": (
-            "Under Section 4(6) of the Forest Rights Act (FRA) 2006, the maximum area of forest land "
-            "that can be recognized for Individual Forest Rights (IFR) is restricted to the area under "
-            "actual occupation and shall in no case exceed 4 hectares per nuclear family."
-        ),
-        "q_en": "What is the maximum land ceiling for Individual Forest Rights (IFR) under FRA 2006?",
-        "a_en": (
-            "Under Section 4(6) of the Forest Rights Act 2006, Individual Forest Rights (IFR) are limited "
-            "to the land under actual occupation and cannot exceed 4 hectares per nuclear family "
-            "[Doc: FRA_2006_Act.pdf | Page 4]."
-        ),
-        "q_hi": "वन अधिकार अधिनियम (FRA) 2006 के तहत व्यक्तिगत वन अधिकार (IFR) के लिए अधिकतम भूमि सीमा क्या है?",
-        "a_hi": (
-            "वन अधिकार अधिनियम (FRA) 2006 की धारा 4(6) के अनुसार व्यक्तिगत वन अधिकार (IFR) वास्तविक कब्जे "
-            "वाली भूमि तक सीमित हैं और प्रति एकल परिवार अधिकतम 4 हेक्टेयर से अधिक नहीं हो सकते "
-            "[Doc: FRA_2006_Act.pdf | Page 4]।"
-        ),
-    },
-    {
-        "doc": "FRA_2006_Act.pdf",
-        "page": "2",
-        "text": (
-            "Section 2(o) of the Forest Rights Act 2006 defines Other Traditional Forest Dwellers (OTFD) "
-            "as any member or community who has for at least three generations (75 years) prior to the "
-            "13th day of December 2005 primarily resided in and depended on the forest or forest land for "
-            "bona fide livelihood needs."
-        ),
-        "q_en": "What is the eligibility criteria and cutoff date for Other Traditional Forest Dwellers (OTFD) under FRA 2006?",
-        "a_en": (
-            "Other Traditional Forest Dwellers (OTFD) must have primarily resided in and depended on "
-            "forest land for bona fide livelihood needs for at least three generations (75 years) prior "
-            "to December 13, 2005 [Doc: FRA_2006_Act.pdf | Page 2]."
-        ),
-        "q_hi": "FRA 2006 के अंतर्गत अन्य पारंपरिक वन निवासी (OTFD) के लिए पात्रता और कट-ऑफ तिथि क्या है?",
-        "a_hi": (
-            "FRA 2006 की धारा 2(o) के अनुसार अन्य पारंपरिक वन निवासियों (OTFD) को 13 दिसंबर 2005 से पहले "
-            "कम से कम तीन पीढ़ियों (75 वर्षों) तक वन भूमि पर निवास और आजीविका के लिए निर्भर होना आवश्यक है "
-            "[Doc: FRA_2006_Act.pdf | Page 2]।"
-        ),
-    },
-    {
-        "doc": "FRA_2006_Act.pdf",
-        "page": "3",
-        "text": (
-            "Section 3(1)(i) of the Forest Rights Act 2006 vests Community Forest Resource (CFR) rights "
-            "in the Gram Sabha to protect, regenerate, conserve, or manage any community forest resource "
-            "which they have been traditionally protecting and conserving for sustainable use."
-        ),
-        "q_en": "Which section of FRA 2006 grants Community Forest Resource (CFR) management rights to the Gram Sabha?",
-        "a_en": (
-            "Section 3(1)(i) of FRA 2006 grants the Gram Sabha Community Forest Resource (CFR) rights "
-            "to protect, regenerate, conserve, and manage traditional community forest resources "
-            "[Doc: FRA_2006_Act.pdf | Page 3]."
-        ),
-        "q_hi": "FRA 2006 की कौन सी धारा ग्राम सभा को सामुदायिक वन संसाधन (CFR) प्रबंधन का अधिकार देती है?",
-        "a_hi": (
-            "FRA 2006 की धारा 3(1)(i) ग्राम सभा को पारंपरिक सामुदायिक वन संसाधनों (CFR) के संरक्षण, "
-            "पुनरुत्पादन और प्रबंधन का अधिकार प्रदान करती है [Doc: FRA_2006_Act.pdf | Page 3]।"
-        ),
-    },
-    # --- Gram Sabha Quorum & FRC Rules ---
-    {
-        "doc": "FRA_Rules_2012.pdf",
-        "page": "7",
-        "text": (
-            "Under Rule 4(2) of the Scheduled Tribes and Other Traditional Forest Dwellers (Recognition "
-            "of Forest Rights) Amendment Rules 2012, the quorum of the Gram Sabha meeting shall be not "
-            "less than one-half (50%) of all adult members of such Gram Sabha, provided that at least "
-            "one-third of the members present are women."
-        ),
-        "q_en": "What is the required Gram Sabha quorum and women's representation under FRA Amendment Rules 2012?",
-        "a_en": (
-            "Under Rule 4(2) of the FRA Amendment Rules 2012, the Gram Sabha quorum must be at least "
-            "one-half (50%) of all adult members, and at least one-third of the members present must be "
-            "women [Doc: FRA_Rules_2012.pdf | Page 7]."
-        ),
-        "q_hi": "FRA संशोधन नियम 2012 के अनुसार ग्राम सभा का कोरम और महिलाओं की भागीदारी कितनी होनी चाहिए?",
-        "a_hi": (
-            "FRA संशोधन नियम 2012 के नियम 4(2) के तहत ग्राम सभा का कोरम सभी वयस्क सदस्यों का कम से कम "
-            "आधा (50%) होना चाहिए, और उपस्थित सदस्यों में कम से कम एक-तिहाई महिलाएं होनी आवश्यक हैं "
-            "[Doc: FRA_Rules_2012.pdf | Page 7]।"
-        ),
-    },
-    {
-        "doc": "FRA_Rules_2012.pdf",
-        "page": "8",
-        "text": (
-            "Rule 3(1) mandates that the Gram Sabha shall elect a Forest Rights Committee (FRC) of not "
-            "less than 10 and not more than 15 members from amongst its members, where at least two-thirds "
-            "of the members shall be Scheduled Tribes and at least one-third shall be women."
-        ),
-        "q_en": "What is the composition rule for the Forest Rights Committee (FRC) elected by the Gram Sabha?",
-        "a_en": (
-            "According to Rule 3(1), the Forest Rights Committee (FRC) must have between 10 and 15 members, "
-            "with at least two-thirds Scheduled Tribes and at least one-third women "
-            "[Doc: FRA_Rules_2012.pdf | Page 8]."
-        ),
-        "q_hi": "ग्राम सभा द्वारा चुनी गई वन अधिकार समिति (FRC) की संरचना के क्या नियम हैं?",
-        "a_hi": (
-            "नियम 3(1) के अनुसार वन अधिकार समिति (FRC) में 10 से 15 सदस्य होने चाहिए, जिनमें से कम से कम "
-            "दो-तिहाई अनुसूचित जनजाति (ST) के सदस्य और कम से कम एक-तिहाई महिलाएं होनी चाहिए "
-            "[Doc: FRA_Rules_2012.pdf | Page 8]।"
-        ),
-    },
-    # --- IS 456:2000 Concrete & Curing ---
-    {
-        "doc": "IS_456_2000.pdf",
-        "page": "27",
-        "text": (
-            "Clause 13.5.1 of IS 456:2000 specifies that exposed surfaces of concrete shall be kept "
-            "continuously in a damp or wet condition for a minimum period of 7 days from the date of "
-            "placing concrete when Ordinary Portland Cement (OPC) is used, and not less than 10 days "
-            "when mineral admixtures or blended cements are used, extended to 14 days in hot and dry weather."
-        ),
-        "q_en": "What is the minimum concrete curing period specified by IS 456:2000 for OPC and blended cements?",
-        "a_en": (
-            "IS 456:2000 Clause 13.5.1 requires a minimum curing period of 7 days for Ordinary Portland "
-            "Cement (OPC), at least 10 days for blended cements or mineral admixtures, and 14 days in "
-            "hot and dry weather [Doc: IS_456_2000.pdf | Page 27]."
-        ),
-        "q_hi": "IS 456:2000 के अनुसार OPC और ब्लेंडेड सीमेंट के लिए कंक्रीट की न्यूनतम क्योरिंग अवधि क्या है?",
-        "a_hi": (
-            "IS 456:2000 के खंड 13.5.1 के अनुसार OPC के लिए न्यूनतम 7 दिन, ब्लेंडेड सीमेंट या मिनरल "
-            "एडमिक्सचर के लिए कम से कम 10 दिन, और गर्म व शुष्क मौसम में 14 दिन क्योरिंग आवश्यक है "
-            "[Doc: IS_456_2000.pdf | Page 27]।"
-        ),
-    },
-    {
-        "doc": "IS_456_2000.pdf",
-        "page": "19",
-        "text": (
-            "Table 5 of IS 456:2000 mandates that the minimum grade of reinforced concrete (RCC) for "
-            "mild exposure conditions shall be M20 with a minimum cement content of 300 kg/m3 and a "
-            "maximum free water-cement ratio of 0.55."
-        ),
-        "q_en": "What is the minimum RCC grade and maximum water-cement ratio for mild exposure under IS 456:2000?",
-        "a_en": (
-            "Under Table 5 of IS 456:2000, mild exposure requires a minimum RCC grade of M20, minimum "
-            "cement content of 300 kg/m3, and a maximum free water-cement ratio of 0.55 "
-            "[Doc: IS_456_2000.pdf | Page 19]."
-        ),
-        "q_hi": "IS 456:2000 के अनुसार सामान्य (mild) वातावरण में RCC का न्यूनतम ग्रेड और अधिकतम जल-सीमेंट अनुपात क्या है?",
-        "a_hi": (
-            "IS 456:2000 की तालिका 5 के अनुसार सामान्य (mild) वातावरण के लिए न्यूनतम RCC ग्रेड M20, "
-            "न्यूनतम सीमेंट मात्रा 300 किग्रा/घन मीटर, और अधिकतम जल-सीमेंट अनुपात 0.55 है "
-            "[Doc: IS_456_2000.pdf | Page 19]।"
-        ),
-    },
-    # --- Seismic Zone III Concrete & Steel Specs ---
-    {
-        "doc": "IS_13920_2016.pdf",
-        "page": "6",
-        "text": (
-            "For buildings located in Seismic Zone III and above, IS 13920:2016 Clause 5.2 specifies "
-            "a minimum concrete grade of M20 (M25 recommended for buildings taller than 15m) and "
-            "ductile steel reinforcement of grade Fe415D or Fe500D with minimum elongation of 14.5% "
-            "and UTS/YS ratio of at least 1.10."
-        ),
-        "q_en": "What concrete grade and steel reinforcement specifications apply in Seismic Zone III per IS 13920:2016?",
-        "a_en": (
-            "IS 13920:2016 Clause 5.2 specifies a minimum concrete grade of M20 (M25 for buildings over "
-            "15m) and ductile Fe415D or Fe500D steel with at least 14.5% elongation and UTS/YS ratio "
-            ">= 1.10 in Seismic Zone III [Doc: IS_13920_2016.pdf | Page 6]."
-        ),
-        "q_hi": "IS 13920:2016 के अनुसार भूकंप क्षेत्र III (Seismic Zone III) में कंक्रीट और स्टील के क्या मानक हैं?",
-        "a_hi": (
-            "IS 13920:2016 के खंड 5.2 के अनुसार भूकंप क्षेत्र III में न्यूनतम M20 कंक्रीट (15 मीटर से ऊंचे "
-            "भवनों के लिए M25) और कम से कम 14.5% बढ़ाव वाले डक्टाइल Fe415D या Fe500D स्टील का उपयोग "
-            "किया जाना चाहिए [Doc: IS_13920_2016.pdf | Page 6]।"
-        ),
-    },
-    {
-        "doc": "IS_13920_2016.pdf",
-        "page": "11",
-        "text": (
-            "In Seismic Zone III ductile beams under IS 13920:2016 Clause 6.3.5, closed stirrups with "
-            "135-degree hooks and 10d extension must be spaced at not more than d/4 or 8 times the "
-            "diameter of the smallest longitudinal bar within a distance of 2d from the column face."
-        ),
-        "q_en": "What is the stirrup spacing and hook requirement for ductile beams in Seismic Zone III?",
-        "a_en": (
-            "Per IS 13920:2016 Clause 6.3.5, ductile beams require closed stirrups with 135-degree hooks "
-            "(10d extension) spaced at no more than d/4 or 8 times the smallest longitudinal bar diameter "
-            "within 2d of the column face [Doc: IS_13920_2016.pdf | Page 11]."
-        ),
-        "q_hi": "भूकंप क्षेत्र III में डक्टाइल बीम के लिए स्टिरप (stirrup) की दूरी और हुक के क्या नियम हैं?",
-        "a_hi": (
-            "IS 13920:2016 के खंड 6.3.5 के अनुसार कॉलम फेस से 2d दूरी के भीतर 135-डिग्री हुक (10d एक्सटेंशन) "
-            "वाले बंद स्टिरप की दूरी d/4 या सबसे छोटे लोंगिट्यूडिनल बार के व्यास के 8 गुना से अधिक नहीं "
-            "होनी चाहिए [Doc: IS_13920_2016.pdf | Page 11]।"
-        ),
-    },
-    # --- GFR 2017 Bid Security & Performance Security ---
-    {
-        "doc": "GFR_2017.pdf",
-        "page": "56",
-        "text": (
-            "Rule 170 of the General Financial Rules (GFR) 2017 states that Bid Security (Earnest Money "
-            "Deposit / EMD) should normally range between 2% to 5% of the estimated value of the goods "
-            "to be procured. Micro and Small Enterprises (MSEs) and Startups recognized by DPIIT are "
-            "exempted from furnishing Bid Security."
-        ),
-        "q_en": "What is the Bid Security (EMD) percentage under GFR 2017 Rule 170 and who is exempted?",
-        "a_en": (
-            "Under GFR 2017 Rule 170, Bid Security (EMD) ranges from 2% to 5% of the estimated procurement "
-            "value, and Micro and Small Enterprises (MSEs) as well as DPIIT-recognized Startups are "
-            "exempted [Doc: GFR_2017.pdf | Page 56]."
-        ),
-        "q_hi": "GFR 2017 नियम 170 के तहत बिड सिक्योरिटी (EMD) कितनी होती है और किसे छूट प्राप्त है?",
-        "a_hi": (
-            "GFR 2017 नियम 170 के अनुसार बिड सिक्योरिटी (EMD) अनुमानित खरीद मूल्य का 2% से 5% तक होती है, "
-            "और सूक्ष्म एवं लघु उद्यमों (MSEs) तथा DPIIT मान्यता प्राप्त स्टार्टअप्स को इससे छूट दी गई है "
-            "[Doc: GFR_2017.pdf | Page 56]।"
-        ),
-    },
-    {
-        "doc": "GFR_2017.pdf",
-        "page": "57",
-        "text": (
-            "Rule 171 of GFR 2017 mandates that Performance Security shall be obtained from the successful "
-            "bidder at 3% to 10% of the value of the contract, valid for a period of 60 days beyond the "
-            "date of completion of all contractual obligations including warranty."
-        ),
-        "q_en": "What is the Performance Security requirement and validity period under GFR 2017 Rule 171?",
-        "a_en": (
-            "GFR 2017 Rule 171 requires Performance Security of 3% to 10% of the contract value from the "
-            "successful bidder, remaining valid for 60 days beyond completion of all contractual and "
-            "warranty obligations [Doc: GFR_2017.pdf | Page 57]."
-        ),
-        "q_hi": "GFR 2017 नियम 171 के अंतर्गत परफॉर्मेंस सिक्योरिटी की दर और वैधता अवधि क्या है?",
-        "a_hi": (
-            "GFR 2017 नियम 171 के अनुसार सफल बोलीदाता से अनुबंध मूल्य का 3% से 10% परफॉर्मेंस सिक्योरिटी "
-            "ली जाती है, जो वारंटी सहित सभी अनुबंध दायित्व पूरे होने के 60 दिन बाद तक वैध रहनी चाहिए "
-            "[Doc: GFR_2017.pdf | Page 57]।"
-        ),
-    },
-    {
-        "doc": "GFR_2017.pdf",
-        "page": "52",
-        "text": (
-            "Rule 154 of GFR 2017 permits direct purchase of goods up to Rs. 50,000 on each occasion "
-            "without inviting quotations or bids, subject to the competent authority recording a "
-            "certificate of reasonableness of price and quality."
-        ),
-        "q_en": "What is the monetary limit for direct purchase without quotations under GFR 2017 Rule 154?",
-        "a_en": (
-            "Under GFR 2017 Rule 154, direct purchase without inviting quotations is permitted up to "
-            "Rs. 50,000 per occasion with a reasonableness certificate from the competent authority "
-            "[Doc: GFR_2017.pdf | Page 52]."
-        ),
-        "q_hi": "GFR 2017 नियम 154 के तहत बिना कोटेशन सीधी खरीद की अधिकतम सीमा क्या है?",
-        "a_hi": (
-            "GFR 2017 नियम 154 के अनुसार सक्षम प्राधिकारी के प्रमाणपत्र के साथ प्रति अवसर 50,000 रुपये तक "
-            "की सीधी खरीद बिना कोटेशन के की जा सकती है [Doc: GFR_2017.pdf | Page 52]।"
-        ),
-    },
+COMPANIES = [
+    "ApexNova Technologies", "VayuCloud Systems", "IndusPay Solutions", "Kiran HealthTech",
+    "Meridian Logistics", "Solstice Retail", "Zenith FinCorp", "OrbitGrid Labs",
+    "Pragati EdTech", "Neelkanth Manufacturing", "VertexSoft India", "Aarohan Enterprises",
 ]
 
-UNANSWERABLE_QUESTIONS: List[Tuple[str, str]] = [
-    (
-        "What is the exact penalty amount for late filing of GST Form GSTR-9C in 2026?",
-        "I am sorry, the provided documents do not contain information about GST Form GSTR-9C late filing penalties.",
-    ),
-    (
-        "What is the maximum permissible wind speed design load for bridges in Assam under IRC 6?",
-        "The provided documents do not contain information regarding IRC 6 bridge wind load specifications for Assam.",
-    ),
-    (
-        "Who is the current District Collector of Mandla district and what is their phone number?",
-        "I cannot answer this because the provided documents do not contain contact details or names of current district officials.",
-    ),
-    (
-        "What is the solar rooftop subsidy percentage under PM Surya Ghar Muft Bijli Yojana?",
-        "The provided documents do not contain details about the PM Surya Ghar Muft Bijli Yojana subsidy rates.",
-    ),
-    (
-        "What is the minimum runway length required for an Airbus A320neo at Leh airport?",
-        "The retrieved context does not contain aviation or airport runway specifications for Leh airport.",
-    ),
-    (
-        "2026 में आयकर अधिनियम की धारा 80C के तहत अधिकतम कर छूट की सीमा क्या है?",
-        "क्षमा करें, दिए गए दस्तावेजों में आयकर अधिनियम की धारा 80C की कर छूट सीमा के बारे में कोई जानकारी उपलब्ध नहीं है।",
-    ),
-    (
-        "प्रधानमंत्री आवास योजना (ग्रामीण) के अंतर्गत पहाड़ी क्षेत्रों में प्रति घर कितनी राशि दी जाती है?",
-        "दिए गए संदर्भ दस्तावेजों में प्रधानमंत्री आवास योजना (ग्रामीण) की वित्तीय सहायता राशि का उल्लेख नहीं है।",
-    ),
-    (
-        "भोपाल मेट्रो रेल परियोजना के फेज-2 की कुल अनुमानित लागत कितनी है?",
-        "उपलब्ध दस्तावेजों में भोपाल मेट्रो रेल परियोजना के फेज-2 की लागत से संबंधित कोई जानकारी नहीं है।",
-    ),
-    (
-        "रेलवे ब्रिज के लिए IS 800 के तहत स्टील गर्डर की न्यूनतम मोटाई क्या है?",
-        "दिए गए दस्तावेजों में IS 800 या रेलवे ब्रिज स्टील गर्डर की मोटाई से जुड़ी जानकारी उपलब्ध नहीं है।",
-    ),
-    (
-        "What is the interest rate for Kisan Credit Card loans above Rs 3 lakh?",
-        "The provided documents do not mention Kisan Credit Card loan interest rates.",
-    ),
+PEOPLE = [
+    "Aarav Sharma", "Priya Nair", "Rohan Kulkarni", "Ananya Iyer", "Vikram Malhotra",
+    "Neha Deshmukh", "Siddharth Verma", "Kavita Joshi", "Arjun Reddy", "Meera Krishnan",
+    "Kabir Mehta", "Divya Menon", "Aditya Rao", "Pooja Agarwal", "Nikhil Bansal",
+    "Sneha Kapoor", "Karan Thakur", "Ritu Choudhary", "Varun Gupta", "Shreya Chatterjee",
 ]
+
+CITIES = [
+    "Bengaluru", "Mumbai", "Pune", "Hyderabad", "Gurugram", "Chennai",
+    "Noida", "Ahmedabad", "Kolkata", "Jaipur", "Kochi", "Indore",
+]
+
+
+def _make_doc(rng: random.Random, prefixes: List[str]) -> Tuple[str, int]:
+    prefix = rng.choice(prefixes)
+    style = rng.randint(0, 3)
+    if style == 0:
+        name = f"{prefix}_{rng.randint(2022, 2027)}.pdf"
+    elif style == 1:
+        name = f"{prefix}_v{rng.randint(1, 6)}.pdf"
+    elif style == 2:
+        name = f"{prefix}_{rng.randint(1000, 9999)}.pdf"
+    else:
+        name = f"{prefix}_Q{rng.randint(1, 4)}_{rng.randint(2023, 2026)}.pdf"
+    return name, rng.randint(1, 60)
+
+
+def _gen_hr_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["HR_Handbook", "Employee_Policy", "PeopleOps_Guide", "Leave_Policy"])
+    comp = rng.choice(COMPANIES)
+    sub = rng.randint(0, 3)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        days = rng.randint(14, 30)
+        carry = rng.randint(5, 12)
+        text = (
+            f"At {comp}, full-time employees receive {days} days of paid annual leave per calendar year, "
+            f"and up to {carry} unused days may be carried forward into the next year."
+        )
+        if hindi:
+            q = f"{comp} में कर्मचारियों को प्रति वर्ष कितने दिन की पेड एनुअल लीव मिलती है और कितने दिन कैरी फॉरवर्ड हो सकते हैं?"
+            a = f"{comp} में कर्मचारियों को प्रति वर्ष {days} दिन की पेड एनुअल लीव मिलती है और अधिकतम {carry} दिन अगले वर्ष में कैरी फॉरवर्ड किए जा सकते हैं {cit}।"
+        else:
+            q = f"How many annual leave days and carry-forward days does {comp} allow?"
+            a = f"{comp} provides {days} paid annual leave days per year, with up to {carry} unused days allowed for carry-forward {cit}."
+    elif sub == 1:
+        wfh_days = rng.randint(2, 4)
+        stipend = rng.randrange(1500, 6000, 500)
+        text = (
+            f"{comp}'s Hybrid Work Policy allows eligible staff to work remotely up to {wfh_days} days "
+            f"per week and provides a monthly home-internet reimbursement limit of Rs {stipend}."
+        )
+        if hindi:
+            q = f"{comp} की हाइब्रिड वर्क पॉलिसी में सप्ताह में कितने दिन रिमोट वर्क और कितना इंटरनेट रिइम्बर्समेंट मिलता है?"
+            a = f"{comp} में कर्मचारी सप्ताह में {wfh_days} दिन रिमोट वर्क कर सकते हैं और प्रति माह Rs {stipend} तक इंटरनेट रिइम्बर्समेंट प्राप्त कर सकते हैं {cit}।"
+        else:
+            q = f"What are the remote work days and internet reimbursement limit at {comp}?"
+            a = f"{comp} allows up to {wfh_days} remote work days per week and reimburses up to Rs {stipend} per month for home internet {cit}."
+    elif sub == 2:
+        notice = rng.choice([30, 45, 60, 90])
+        probation_notice = rng.choice([7, 15])
+        text = (
+            f"Confirmed employees at {comp} must serve a {notice}-day notice period upon resignation, "
+            f"whereas employees on probation are subject to a {probation_notice}-day notice period."
+        )
+        if hindi:
+            q = f"{comp} में कन्फर्म कर्मचारियों और प्रोबेशन कर्मचारियों के लिए नोटिस पीरियड कितना है?"
+            a = f"{comp} में कन्फर्म कर्मचारियों के लिए {notice} दिन और प्रोबेशन पर कर्मचारियों के लिए {probation_notice} दिन का नोटिस पीरियड है {cit}।"
+        else:
+            q = f"What is the resignation notice period for confirmed and probationary staff at {comp}?"
+            a = f"Confirmed employees at {comp} have a {notice}-day notice period, while employees on probation have a {probation_notice}-day notice period {cit}."
+    else:
+        meal = rng.randrange(500, 2000, 100)
+        travel = rng.randrange(5000, 20000, 1000)
+        text = (
+            f"Business travel expenses at {comp} are reimbursed up to Rs {meal} per day for meals and "
+            f"Rs {travel} per domestic trip for hotel accommodation with valid GST receipts."
+        )
+        if hindi:
+            q = f"{comp} में बिजनेस ट्रैवल के लिए दैनिक भोजन और होटल रिइम्बर्समेंट की सीमा क्या है?"
+            a = f"{comp} में वैध GST रसीद के साथ भोजन के लिए प्रति दिन Rs {meal} और घरेलू यात्रा पर होटल के लिए Rs {travel} तक रिइम्बर्समेंट मिलता है {cit}।"
+        else:
+            q = f"What are the meal and hotel reimbursement caps for business travel at {comp}?"
+            a = f"{comp} reimburses up to Rs {meal} per day for meals and Rs {travel} per domestic trip for hotels with valid GST receipts {cit}."
+
+    return {"domain": "hr", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_software_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["API_Guide", "SDK_Reference", "Dev_Docs", "Gateway_Spec"])
+    svc = rng.choice(["VayuAPI", "IndusAuth", "PulseStream", "NovaDB", "GridSearch API", "PayCore API"])
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        rpm = rng.choice([60, 120, 300, 600, 1200, 2500])
+        header = rng.choice(["X-API-Key", "Authorization: Bearer <token>", "X-Client-Secret"])
+        text = (
+            f"The {svc} production endpoint enforces a rate limit of {rpm} requests per minute per tenant. "
+            f"All requests must include the `{header}` authentication header over TLS 1.3."
+        )
+        if hindi:
+            q = f"{svc} की रेट लिमिट और आवश्यक ऑथेंटिकेशन हेडर क्या है?"
+            a = f"{svc} की रेट लिमिट {rpm} रिक्वेस्ट प्रति मिनट है और हर रिक्वेस्ट में `{header}` हेडर होना आवश्यक है {cit}।"
+        else:
+            q = f"What is the rate limit and required authentication header for {svc}?"
+            a = f"{svc} enforces a rate limit of {rpm} requests per minute and requires the `{header}` authentication header {cit}."
+    elif sub == 1:
+        timeout = rng.choice([5, 10, 15, 30, 45, 60])
+        retries = rng.randint(2, 5)
+        text = (
+            f"By default, the {svc} client SDK sets an HTTP request timeout of {timeout} seconds "
+            f"and performs up to {retries} automatic retries with exponential backoff on HTTP 503 errors."
+        )
+        if hindi:
+            q = f"{svc} SDK में डिफ़ॉल्ट टाइमआउट और ऑटोमैटिक रीट्राई की संख्या क्या है?"
+            a = f"{svc} SDK में डिफ़ॉल्ट HTTP टाइमआउट {timeout} सेकंड है और HTTP 503 एरर पर अधिकतम {retries} बार ऑटोमैटिक रीट्राई किया जाता है {cit}।"
+        else:
+            q = f"What are the default HTTP timeout and retry count in the {svc} SDK?"
+            a = f"The {svc} SDK uses a default timeout of {timeout} seconds and performs up to {retries} retries with exponential backoff on HTTP 503 errors {cit}."
+    else:
+        old_v = f"v{rng.randint(1, 3)}"
+        new_v = f"v{int(old_v[1:]) + 1}"
+        date_str = f"{rng.choice(['March', 'June', 'September', 'December'])} {rng.randint(1, 28)}, {rng.randint(2026, 2028)}"
+        text = (
+            f"{svc} {old_v} endpoints are officially deprecated and will reach end-of-life on {date_str}. "
+            f"Integrations must migrate to {svc} {new_v} before the sunset date."
+        )
+        if hindi:
+            q = f"{svc} {old_v} कब बंद (end-of-life) होगा और किस वर्ज़न पर माइग्रेट करना है?"
+            a = f"{svc} {old_v} की एंड-ऑफ-लाइफ तिथि {date_str} है और इससे पहले {svc} {new_v} पर माइग्रेट करना आवश्यक है {cit}।"
+        else:
+            q = f"When does {svc} {old_v} reach end-of-life and which version should developers migrate to?"
+            a = f"{svc} {old_v} reaches end-of-life on {date_str}, and developers must migrate to {svc} {new_v} before then {cit}."
+
+    return {"domain": "software", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_finance_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["Invoice", "Quarterly_Report", "Finance_SOP", "Billing_Terms"])
+    comp = rng.choice(COMPANIES)
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        net_days = rng.choice([15, 30, 45, 60])
+        late_fee = rng.choice([1.2, 1.5, 2.0, 2.5])
+        gst = rng.choice([5, 12, 18, 28])
+        text = (
+            f"Invoices issued by {comp} carry Net {net_days} payment terms with {gst}% GST applied. "
+            f"Overdue balances accrue a late payment fee of {late_fee}% per month."
+        )
+        if hindi:
+            q = f"{comp} के इनवॉइस की पेमेंट टर्म, GST दर और लेट फीस कितनी है?"
+            a = f"{comp} के इनवॉइस पर Net {net_days} पेमेंट टर्म, {gst}% GST और देरी से भुगतान पर {late_fee}% प्रति माह लेट फीस लागू होती है {cit}।"
+        else:
+            q = f"What are the payment terms, GST rate, and late fee on invoices from {comp}?"
+            a = f"{comp} invoices use Net {net_days} payment terms, apply {gst}% GST, and charge a {late_fee}% monthly late fee on overdue balances {cit}."
+    elif sub == 1:
+        qtr = f"Q{rng.randint(1, 4)} FY{rng.randint(25, 27)}"
+        rev = rng.randint(12, 480)
+        yoy = rng.randint(6, 38)
+        text = (
+            f"In {qtr}, {comp} reported total consolidated revenue of Rs {rev} crore, "
+            f"representing a {yoy}% year-over-year growth compared to the prior period."
+        )
+        if hindi:
+            q = f"{qtr} में {comp} का कुल रेवेन्यू और सालाना ग्रोथ (YoY) कितना रहा?"
+            a = f"{qtr} में {comp} का कुल रेवेन्यू Rs {rev} करोड़ रहा, जो पिछले वर्ष की तुलना में {yoy}% की वृद्धि दर्शाता है {cit}।"
+        else:
+            q = f"What was {comp}'s total revenue and YoY growth in {qtr}?"
+            a = f"In {qtr}, {comp} reported Rs {rev} crore in total revenue, up {yoy}% year-over-year {cit}."
+    else:
+        inv_no = rng.randint(10000, 99999)
+        amt = rng.randrange(25000, 950000, 5000)
+        due = f"{rng.choice(['Jan', 'Feb', 'May', 'Aug', 'Nov'])} {rng.randint(10, 28)}, 2026"
+        text = (
+            f"Invoice #{inv_no} billed to {comp} totals Rs {amt:,} inclusive of taxes and is due for "
+            f"settlement via NEFT/RTGS on or before {due}."
+        )
+        if hindi:
+            q = f"इनवॉइस #{inv_no} की कुल राशि और अंतिम भुगतान तिथि क्या है?"
+            a = f"{comp} के नाम जारी इनवॉइस #{inv_no} की कुल राशि Rs {amt:,} है और इसके भुगतान की अंतिम तिथि {due} है {cit}।"
+        else:
+            q = f"What is the total amount and due date for Invoice #{inv_no}?"
+            a = f"Invoice #{inv_no} for {comp} totals Rs {amt:,} and is due on or before {due} {cit}."
+
+    return {"domain": "finance", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_legal_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["SLA_Contract", "MSA_Agreement", "NDA_Policy", "Vendor_Terms"])
+    comp = rng.choice(COMPANIES)
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        uptime = rng.choice(["99.5%", "99.9%", "99.95%", "99.99%"])
+        credit = rng.choice([5, 10, 15, 20])
+        text = (
+            f"Under the Master Service Agreement with {comp}, the provider guarantees {uptime} monthly "
+            f"service uptime; any breach entitles the customer to a {credit}% monthly service credit."
+        )
+        if hindi:
+            q = f"{comp} के SLA समझौते में मासिक अपटाइम गारंटी और सर्विस क्रेडिट कितना है?"
+            a = f"{comp} के समझौते में {uptime} मासिक अपटाइम की गारंटी है और इसके उल्लंघन पर {credit}% मासिक सर्विस क्रेडिट मिलता है {cit}।"
+        else:
+            q = f"What uptime guarantee and service credit apply under {comp}'s SLA?"
+            a = f"{comp}'s agreement guarantees {uptime} monthly uptime, with a {credit}% monthly service credit for any breach {cit}."
+    elif sub == 1:
+        term_days = rng.choice([30, 60, 90])
+        city = rng.choice(CITIES)
+        text = (
+            f"Either party may terminate the {comp} vendor contract for convenience by delivering "
+            f"{term_days} days' prior written notice. Disputes are governed by arbitration seated in {city}."
+        )
+        if hindi:
+            q = f"{comp} कॉन्ट्रैक्ट समाप्त करने के लिए कितने दिन का लिखित नोटिस आवश्यक है और मध्यस्थता (arbitration) कहां होगी?"
+            a = f"{comp} कॉन्ट्रैक्ट समाप्त करने के लिए {term_days} दिन का पूर्व लिखित नोटिस देना होगा और विवादों की मध्यस्थता {city} में होगी {cit}।"
+        else:
+            q = f"How much written notice is required to terminate the {comp} contract and where is arbitration seated?"
+            a = f"Terminating the {comp} contract requires {term_days} days' prior written notice, with arbitration seated in {city} {cit}."
+    else:
+        nda_yrs = rng.randint(2, 7)
+        text = (
+            f"All proprietary technical and pricing disclosures exchanged with {comp} remain strictly "
+            f"confidential for a duration of {nda_yrs} years following the expiration of the NDA."
+        )
+        if hindi:
+            q = f"{comp} के NDA के तहत गोपनीयता (confidentiality) की अवधि कितने वर्षों तक रहती है?"
+            a = f"{comp} के साथ साझा की गई गोपनीय जानकारी NDA समाप्त होने के {nda_yrs} वर्षों तक गोपनीय रहती है {cit}।"
+        else:
+            q = f"How long do confidentiality obligations last under the {comp} NDA?"
+            a = f"Confidentiality obligations under the {comp} NDA remain in force for {nda_yrs} years after expiration {cit}."
+
+    return {"domain": "legal", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_healthcare_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["Lab_Report", "Clinical_Guide", "Patient_Summary", "Rx_Protocol"])
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        low = rng.choice([70, 75])
+        high = rng.choice([99, 100])
+        hba1c = rng.choice(["5.7%", "5.6%"])
+        text = (
+            f"Standard adult fasting blood glucose reference range is {low} to {high} mg/dL, "
+            f"and a normal HbA1c level is below {hba1c}."
+        )
+        if hindi:
+            q = "लैब रिपोर्ट के अनुसार वयस्कों के लिए सामान्य फास्टिंग ब्लड ग्लूकोज और HbA1c की सीमा क्या है?"
+            a = f"सामान्य फास्टिंग ब्लड ग्लूकोज की सीमा {low} से {high} mg/dL है और सामान्य HbA1c स्तर {hba1c} से कम होता है {cit}।"
+        else:
+            q = "What are the reference ranges for adult fasting blood glucose and normal HbA1c?"
+            a = f"The adult fasting blood glucose reference range is {low} to {high} mg/dL, and normal HbA1c is below {hba1c} {cit}."
+    elif sub == 1:
+        dose = rng.choice([250, 500, 650])
+        hrs = rng.choice([6, 8, 12])
+        days = rng.randint(5, 14)
+        text = (
+            f"The prescribed oral dosage schedule is {dose} mg every {hrs} hours after meals for a "
+            f"course of {days} days, followed by a clinical review."
+        )
+        if hindi:
+            q = "दवा की निर्धारित खुराक (dosage) और कोर्स की अवधि क्या है?"
+            a = f"निर्धारित खुराक भोजन के बाद हर {hrs} घंटे में {dose} mg है, जिसे {days} दिनों तक लेना है {cit}।"
+        else:
+            q = "What is the prescribed dosage schedule and duration?"
+            a = f"The prescribed schedule is {dose} mg every {hrs} hours after meals for {days} days {cit}."
+    else:
+        weeks = rng.choice([2, 4, 6, 8, 12])
+        test = rng.choice(["Lipid Profile", "Thyroid Panel (TSH)", "Complete Blood Count", "Vitamin D3"])
+        text = (
+            f"Patients starting therapy should schedule a follow-up {test} lab test after {weeks} weeks "
+            f"to evaluate treatment response."
+        )
+        if hindi:
+            q = f"उपचार शुरू करने के कितने सप्ताह बाद {test} की फॉलो-अप जांच करवानी चाहिए?"
+            a = f"उपचार शुरू करने के {weeks} सप्ताह बाद {test} की फॉलो-अप जांच करवानी चाहिए {cit}।"
+        else:
+            q = f"When should the follow-up {test} be scheduled?"
+            a = f"A follow-up {test} should be scheduled after {weeks} weeks to evaluate treatment response {cit}."
+
+    return {"domain": "healthcare", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_ecommerce_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["Product_Manual", "Warranty_Card", "Store_Policy", "Spec_Sheet"])
+    prod = rng.choice(["AeroBook Pro 14", "NovaTab X2", "VayuBuds Max", "ZenWatch S5", "VoltCharge PowerBank"])
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        mah = rng.choice([4500, 5000, 6000, 10000, 20000])
+        watt = rng.choice([33, 45, 65, 100])
+        warranty = rng.choice([12, 18, 24])
+        text = (
+            f"The {prod} packs a {mah} mAh battery supporting {watt}W fast charging and includes a "
+            f"{warranty}-month standard manufacturer warranty."
+        )
+        if hindi:
+            q = f"{prod} की बैटरी क्षमता, फास्ट चार्जिंग और वारंटी अवधि कितनी है?"
+            a = f"{prod} में {mah} mAh की बैटरी, {watt}W फास्ट चार्जिंग और {warranty} महीने की वारंटी मिलती है {cit}।"
+        else:
+            q = f"What are the battery capacity, charging wattage, and warranty of the {prod}?"
+            a = f"The {prod} has a {mah} mAh battery, supports {watt}W fast charging, and comes with a {warranty}-month warranty {cit}."
+    elif sub == 1:
+        ret_days = rng.choice([7, 10, 14, 30])
+        ship_days = rng.choice([2, 3, 5])
+        text = (
+            f"Orders for the {prod} ship within {ship_days} business days and are eligible for a "
+            f"{ret_days}-day hassle-free return or replacement in original packaging."
+        )
+        if hindi:
+            q = f"{prod} की शिपिंग अवधि और रिटर्न पॉलिसी कितने दिनों की है?"
+            a = f"{prod} के ऑर्डर {ship_days} कार्यदिवसों में शिप होते हैं और मूल पैकेजिंग में {ret_days} दिनों की रिटर्न/रिप्लेसमेंट सुविधा मिलती है {cit}।"
+        else:
+            q = f"What are the shipping time and return window for the {prod}?"
+            a = f"The {prod} ships within {ship_days} business days and has a {ret_days}-day return or replacement window {cit}."
+    else:
+        weight = rng.choice(["1.25 kg", "1.42 kg", "480 g", "210 g"])
+        ip = rng.choice(["IP54", "IP67", "IP68"])
+        text = (
+            f"The {prod} weighs {weight} and is certified {ip} for dust and water resistance."
+        )
+        if hindi:
+            q = f"{prod} का वजन और डस्ट/वाटर रेजिस्टेंस रेटिंग क्या है?"
+            a = f"{prod} का वजन {weight} है और इसे {ip} डस्ट व वाटर रेजिस्टेंस रेटिंग मिली है {cit}।"
+        else:
+            q = f"What is the weight and IP rating of the {prod}?"
+            a = f"The {prod} weighs {weight} and is rated {ip} for dust and water resistance {cit}."
+
+    return {"domain": "ecommerce", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_education_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["Academic_Bulletin", "Exam_Rules", "Course_Syllabus", "Student_Handbook"])
+    univ = rng.choice(["Nalanda Tech University", "Deccan Institute of Science", "Vindhya Engineering College", "Kaveri National University"])
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        att = rng.choice([75, 80, 85])
+        credits = rng.choice([120, 140, 160, 180])
+        text = (
+            f"At {univ}, students must maintain a minimum attendance of {att}% in each course to appear "
+            f"for end-semester exams and must complete {credits} credits to graduate."
+        )
+        if hindi:
+            q = f"{univ} में परीक्षा में बैठने के लिए न्यूनतम उपस्थिति और स्नातक के लिए कुल क्रेडिट कितने आवश्यक हैं?"
+            a = f"{univ} में परीक्षा के लिए न्यूनतम {att}% उपस्थिति और स्नातक के लिए {credits} क्रेडिट पूरे करना अनिवार्य है {cit}।"
+        else:
+            q = f"What are the minimum attendance and graduation credit requirements at {univ}?"
+            a = f"{univ} requires at least {att}% course attendance to take end-semester exams and {credits} total credits to graduate {cit}."
+    elif sub == 1:
+        mid = rng.choice([20, 25, 30])
+        final = rng.choice([50, 60])
+        lab = 100 - mid - final
+        text = (
+            f"Course grading at {univ} allocates {mid}% weightage to mid-semester tests, {lab}% to "
+            f"assignments and labs, and {final}% to the final examination."
+        )
+        if hindi:
+            q = f"{univ} में मिड-सेमेस्टर, लैब/असाइनमेंट और फाइनल परीक्षा का वेटेज कितना है?"
+            a = f"{univ} में मिड-सेमेस्टर का वेटेज {mid}%, लैब व असाइनमेंट का {lab}% और फाइनल परीक्षा का {final}% है {cit}।"
+        else:
+            q = f"What is the exam and assignment weightage breakdown at {univ}?"
+            a = f"Grading at {univ} is weighted {mid}% for mid-semester tests, {lab}% for labs/assignments, and {final}% for the final exam {cit}."
+    else:
+        cgpa = rng.choice(["6.0", "6.5", "7.0", "7.5"])
+        text = (
+            f"Merit scholarships at {univ} require maintaining a minimum CGPA of {cgpa} with zero active "
+            f"backlogs in the preceding academic year."
+        )
+        if hindi:
+            q = f"{univ} में मेरिट स्कॉलरशिप के लिए न्यूनतम CGPA कितना होना चाहिए?"
+            a = f"{univ} में मेरिट स्कॉलरशिप के लिए बिना किसी बैकलॉग के न्यूनतम {cgpa} CGPA बनाए रखना आवश्यक है {cit}।"
+        else:
+            q = f"What minimum CGPA is required to keep a merit scholarship at {univ}?"
+            a = f"Students at {univ} must maintain a minimum CGPA of {cgpa} with zero active backlogs to retain merit scholarships {cit}."
+
+    return {"domain": "education", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+def _gen_operations_fact(rng: random.Random, hindi: bool) -> Dict[str, object]:
+    doc, page = _make_doc(rng, ["Warehouse_SOP", "Logistics_Manual", "Safety_Protocol", "ColdChain_Spec"])
+    hub = rng.choice(["Bhiwandi Hub", "Hosur Fulfillment Center", "Manesar Depot", "Sri City Warehouse"])
+    sub = rng.randint(0, 2)
+    cit = f"[Doc: {doc} | Page {page}]"
+
+    if sub == 0:
+        cutoff = rng.choice(["2:00 PM", "3:30 PM", "4:00 PM", "5:00 PM"])
+        text = (
+            f"Same-day dispatch orders at {hub} must be confirmed before the {cutoff} IST cutoff; "
+            f"orders placed after {cutoff} are scheduled for the next morning's line-haul."
+        )
+        if hindi:
+            q = f"{hub} में सेम-डे डिस्पैच के लिए कट-ऑफ समय क्या है?"
+            a = f"{hub} में सेम-डे डिस्पैच के लिए ऑर्डर {cutoff} IST से पहले कन्फर्म होना आवश्यक है {cit}।"
+        else:
+            q = f"What is the same-day dispatch cutoff time at {hub}?"
+            a = f"Same-day dispatch orders at {hub} must be confirmed before {cutoff} IST {cit}."
+    elif sub == 1:
+        t_min = rng.choice([2, 4])
+        t_max = rng.choice([8, 10])
+        alert_min = rng.choice([10, 15, 20])
+        text = (
+            f"Cold-chain storage bays at {hub} must be maintained strictly between {t_min}°C and {t_max}°C. "
+            f"Any temperature excursion lasting longer than {alert_min} minutes triggers an automated QA alarm."
+        )
+        if hindi:
+            q = f"{hub} में कोल्ड-चेन स्टोरेज का तापमान कितना रहना चाहिए और अलार्म कब बजता है?"
+            a = f"{hub} में कोल्ड-चेन स्टोरेज को {t_min}°C से {t_max}°C के बीच रखा जाना चाहिए, और {alert_min} मिनट से अधिक के विचलन पर QA अलार्म सक्रिय होता है {cit}।"
+        else:
+            q = f"What is the cold-chain temperature range and alarm threshold at {hub}?"
+            a = f"Cold-chain bays at {hub} must stay between {t_min}°C and {t_max}°C, and excursions exceeding {alert_min} minutes trigger an automated QA alarm {cit}."
+    else:
+        speed = rng.choice([8, 10, 12])
+        load = rng.choice([1500, 2000, 2500])
+        text = (
+            f"Forklifts operating inside {hub} aisles must not exceed a maximum speed of {speed} km/h "
+            f"and a safe lifting capacity of {load} kg."
+        )
+        if hindi:
+            q = f"{hub} के अंदर फोर्कलिफ्ट की अधिकतम गति और भार क्षमता क्या है?"
+            a = f"{hub} के अंदर फोर्कलिफ्ट की अधिकतम गति {speed} km/h और सुरक्षित भार क्षमता {load} kg है {cit}।"
+        else:
+            q = f"What are the forklift speed limit and safe load capacity inside {hub}?"
+            a = f"Inside {hub}, forklifts are limited to {speed} km/h and a maximum safe lifting capacity of {load} kg {cit}."
+
+    return {"domain": "operations", "doc": doc, "page": page, "text": text, "q": q, "a": a}
+
+
+DOMAIN_GENERATORS: List[Callable[[random.Random, bool], Dict[str, object]]] = [
+    _gen_hr_fact,
+    _gen_software_fact,
+    _gen_finance_fact,
+    _gen_legal_fact,
+    _gen_healthcare_fact,
+    _gen_ecommerce_fact,
+    _gen_education_fact,
+    _gen_operations_fact,
+]
+
+
+# =============================================================================
+# 2. Clean Domain-Agnostic Abstention Questions (ZERO `[Doc: ...]` Tags!)
+# =============================================================================
+
+ABSTENTION_BANK: List[Tuple[str, str]] = [
+    ("What is the company's stock ticker symbol on the NSE?", "The provided documents do not contain information about the company's NSE stock ticker symbol."),
+    ("Who is the Chief Information Security Officer and what is their direct email?", "I am sorry, the provided documents do not list the Chief Information Security Officer or their email address."),
+    ("What is the exact customs duty percentage for importing lithium cells from Japan?", "The provided documents do not contain customs duty rates for importing lithium cells."),
+    ("What is the maximum payload weight allowed on a Boeing 777 freighter?", "The provided documents do not include aviation payload specifications for a Boeing 777 freighter."),
+    ("What is the tuition fee for the PhD program in Astrophysics?", "The provided documents do not mention tuition fees for a PhD program in Astrophysics."),
+    ("What is the recommended pediatric dosage for Amoxicillin in infants?", "The provided documents do not contain pediatric dosage instructions for Amoxicillin."),
+    ("What is the GraphQL pagination cursor TTL in seconds?", "The provided documents do not specify a GraphQL pagination cursor TTL."),
+    ("What is the exact overtime pay multiplier for weekend shifts in Germany?", "The provided documents do not cover weekend overtime pay multipliers in Germany."),
+    ("What is the penalty clause for late delivery of maritime shipping containers?", "The provided documents do not contain penalty clauses for maritime container delays."),
+    ("What is the replacement cost of an OLED display panel out of warranty?", "The provided documents do not mention out-of-warranty OLED display replacement costs."),
+    ("इस कंपनी के मुख्य कार्यकारी अधिकारी (CEO) का व्यक्तिगत फोन नंबर क्या है?", "क्षमा करें, दिए गए दस्तावेजों में CEO का व्यक्तिगत फोन नंबर उपलब्ध नहीं है."),
+    ("कंपनी के आगामी वित्तीय वर्ष 2029 के लिए अनुमानित लाभांश (dividend) कितना है?", "दिए गए दस्तावेजों में वित्तीय वर्ष 2029 के अनुमानित लाभांश के बारे में कोई जानकारी नहीं है."),
+    ("क्या इस उत्पाद के लिए अंतरराष्ट्रीय एयरपोर्ट लाउंज एक्सेस शामिल है?", "उपलब्ध दस्तावेजों में अंतरराष्ट्रीय एयरपोर्ट लाउंज एक्सेस का कोई उल्लेख नहीं है."),
+    ("बायोमेडिकल वेस्ट के निपटान के लिए 2028 का नया शुल्क कितना है?", "दिए गए संदर्भ दस्तावेजों में बायोमेडिकल वेस्ट निपटान शुल्क की जानकारी उपलब्ध नहीं है."),
+    ("इस विश्वविद्यालय के हॉस्टल में मासिक मेस शुल्क कितना है?", "दिए गए दस्तावेजों में हॉस्टल के मासिक मेस शुल्क का विवरण नहीं है."),
+    ("इस गोदाम के लिए ड्रोन डिलीवरी की अधिकतम उड़ान सीमा कितनी है?", "उपलब्ध दस्तावेजों में ड्रोन डिलीवरी की उड़ान सीमा से संबंधित कोई जानकारी नहीं है."),
+]
+
+
+# =============================================================================
+# 3. Natural Bilingual Greetings & General Chat Pool
+# =============================================================================
 
 GREETING_CONVERSATIONS: List[Tuple[str, str]] = [
     ("Hello", "Hello! I am Dhruva-500M, your bilingual English and Hindi assistant. How can I help you today?"),
-    ("Hi there!", "Hi! How can I assist you today? Feel free to ask questions in English or Hindi."),
-    ("Hey", "Hello! How can I help you today?"),
-    ("Good morning!", "Good morning! How can I help you with your questions or documents today?"),
+    ("Hi", "Hi! How can I help you today?"),
+    ("Hi there!", "Hi there! Ask me anything in English, Hindi, or Hinglish."),
+    ("Hey", "Hey! What can I help you with today?"),
+    ("Hey Dhruva", "Hello! I am ready to help. What would you like to work on?"),
+    ("Hello, how are you?", "I am doing great, thank you! How can I assist you today?"),
+    ("Good morning", "Good morning! How can I help you with your questions or documents today?"),
+    ("Good evening!", "Good evening! What can I help you with?"),
+    ("Who are you?", "I am Northh Dhruva-500M, a bilingual English and Hindi AI assistant built for document Q&A, general chat, and structured JSON extraction."),
+    ("What can you do?", "I can answer questions in English and Hindi, extract cited answers from your documents, and convert unstructured text into structured JSON tables or specification cards."),
+    ("Thanks!", "You're welcome! Let me know if you need anything else."),
+    ("Thank you!", "You're welcome! Happy to help anytime."),
     ("Namaste", "Namaste! मैं ध्रुव-500M हूँ। बताइए, आज मैं आपकी किस प्रकार सहायता कर सकता हूँ?"),
+    ("Namaste, aap kaun hain?", "Namaste! Main Northh Dhruva-500M hoon, ek bilingual English aur Hindi AI assistant. Aaj main aapki kya madad kar sakta hoon?"),
+    ("Kaise ho?", "Main bilkul theek hoon, shukriya! Aap kaise hain? Batayiye kya madad karoon?"),
+    ("Aap kaise hain?", "Main bilkul theek hoon, dhanyawad! Aaj main aapki kis prakar sahayata kar sakta hoon?"),
+    ("Kya haal hai?", "Sab badhiya hai! Batayiye, aaj kis topic par baat karni hai?"),
+    ("Dhruva kya kar sakta hai?", "Main English aur Hindi mein sawalon ke jawab de sakta hoon, documents se accurate citations nikal sakta hoon, aur structured JSON tables ya specs cards bana sakta hoon."),
+    ("Shukriya!", "Aapka swagat hai! Koi aur sawal ho to zaroor puchein."),
     ("नमस्ते", "नमस्ते! मैं ध्रुव-500M हूँ, आपका द्विभाषी एआई सहायक। आज मैं आपकी क्या मदद कर सकता हूँ?"),
     ("नमस्ते, आप कैसे हैं?", "नमस्ते! मैं बिल्कुल ठीक हूँ, धन्यवाद। बताइए, आज मैं आपकी क्या सहायता कर सकता हूँ?"),
-    ("Who are you?", "I am Northh Dhruva-500M, a 470.6M-parameter bilingual (English & Hindi) foundation model built for grounded Q&A, chat, and structured JSON extraction."),
-    ("आप कौन हैं?", "मैं नॉर्थ ध्रुव-500M (Northh Dhruva-500M) हूँ, एक द्विभाषी (हिंदी और अंग्रेजी) एआई मॉडल जिसे सटीक उत्तर, दस्तावेज़ विश्लेषण और संरचित डेटा निष्कर्षण के लिए बनाया गया है।"),
-    ("Thank you!", "You're welcome! Let me know if you need anything else."),
+    ("आप कौन हैं?", "मैं नॉर्थ ध्रुव-500M हूँ, एक द्विभाषी (हिंदी और अंग्रेजी) एआई मॉडल जिसे दस्तावेज़ विश्लेषण, बातचीत और संरचित JSON डेटा निष्कर्षण के लिए बनाया गया है।"),
     ("धन्यवाद!", "आपका स्वागत है! यदि आपको कोई और जानकारी चाहिए तो बेझिझक पूछें।"),
-    ("How are you doing today?", "I'm doing great and ready to help! What would you like to work on today?"),
-]
-
-JSON_REPLAY_TEMPLATES: List[Dict[str, str]] = [
-    {
-        "context": (
-            "Forest Rights Act (FRA) Gram Sabha Claim Register - {district} District:\n"
-            "1. Claimant: {n1}, Village: {v1}, Area Claimed: {a1} Ha, Status: {s1}\n"
-            "2. Claimant: {n2}, Village: {v2}, Area Claimed: {a2} Ha, Status: {s2}\n"
-            "3. Claimant: {n3}, Village: {v3}, Area Claimed: {a3} Ha, Status: {s3}"
-        ),
-        "instruction": "Extract the FRA land claims into a structured JSON table.",
-        "kind": "table",
-    },
-    {
-        "context": (
-            "Contractor Quotation: {pkg} at Rs {price} per sq.ft. "
-            "Specifications: {cement}, {steel}, {wiring}, and {paint}."
-        ),
-        "instruction": "Extract the construction quote into a specs_card JSON.",
-        "kind": "specs_card",
-    },
 ]
 
 
-def _format_chunks(chunks: List[Dict[str, str]]) -> str:
-    parts = []
-    for idx, ch in enumerate(chunks, start=1):
-        parts.append(f"[Chunk {idx} | Doc: {ch['doc']} | Page {ch['page']}]\n{ch['text']}")
-    return "\n\n".join(parts)
+# =============================================================================
+# 4. Domain-Agnostic JSON Replay Generator (`table` & `specs_card`)
+# =============================================================================
+
+def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
+    kind = rng.randint(0, 3)
+    num_rows = rng.randint(2, 4)
+
+    if kind == 0:
+        # Employee HR Leave Table
+        depts = ["Engineering", "Finance", "Product", "Operations", "HR", "Design", "Legal"]
+        statuses = ["Active", "On Leave", "Remote", "Probation"]
+        names = rng.sample(PEOPLE, k=num_rows)
+        lines, rows = [], []
+        for idx, name in enumerate(names, 1):
+            dept = rng.choice(depts)
+            bal = f"{rng.randint(4, 24)} days"
+            st = rng.choice(statuses)
+            lines.append(f"{idx}. Employee: {name}, Department: {dept}, Leave Balance: {bal}, Status: {st}")
+            rows.append([name, dept, bal, st])
+        ctx = f"HR Roster - {rng.choice(COMPANIES)}:\n" + "\n".join(lines)
+        inst = "Extract the employee leave roster into a structured JSON table."
+        obj = {"type": "table", "columns": ["Employee", "Department", "Leave Balance", "Status"], "rows": rows}
+    elif kind == 1:
+        # Invoice Line Items Table
+        items = ["Cloud GPU Hours", "API Enterprise License", "SSL Wildcard Cert", "Managed PostgreSQL", "Data Backup Storage", "Onboarding Support"]
+        picked = rng.sample(items, k=num_rows)
+        lines, rows = [], []
+        for idx, item in enumerate(picked, 1):
+            qty = rng.randint(1, 20)
+            unit = rng.randrange(500, 15000, 500)
+            total = qty * unit
+            lines.append(f"{idx}. Item: {item}, Quantity: {qty}, Unit Price: Rs {unit}, Total: Rs {total}")
+            rows.append([item, str(qty), f"Rs {unit}", f"Rs {total}"])
+        ctx = f"Invoice #{rng.randint(1000, 9999)} Summary:\n" + "\n".join(lines)
+        inst = "Extract the invoice line items into a structured JSON table."
+        obj = {"type": "table", "columns": ["Item", "Quantity", "Unit Price", "Total"], "rows": rows}
+    elif kind == 2:
+        # Student Grades Table
+        courses = ["Machine Learning", "Database Systems", "Operating Systems", "Linear Algebra", "Data Structures", "Cloud Computing"]
+        grades = ["A+", "A", "B+", "B", "A-"]
+        names = rng.sample(PEOPLE, k=num_rows)
+        lines, rows = [], []
+        for idx, name in enumerate(names, 1):
+            course = rng.choice(courses)
+            score = f"{rng.randint(68, 99)}%"
+            grade = rng.choice(grades)
+            lines.append(f"{idx}. Student: {name}, Course: {course}, Score: {score}, Grade: {grade}")
+            rows.append([name, course, score, grade])
+        ctx = "Semester Grade Sheet:\n" + "\n".join(lines)
+        inst = "Extract the student grades into a structured JSON table."
+        obj = {"type": "table", "columns": ["Student", "Course", "Score", "Grade"], "rows": rows}
+    else:
+        # E-commerce Order Logs Table
+        statuses = ["Delivered", "Shipped", "Processing", "Returned", "Cancelled"]
+        names = rng.sample(PEOPLE, k=num_rows)
+        lines, rows = [], []
+        for idx, name in enumerate(names, 1):
+            oid = f"ORD-{rng.randint(10000, 99999)}"
+            amt = f"Rs {rng.randrange(499, 25000, 100)}"
+            st = rng.choice(statuses)
+            lines.append(f"{idx}. Order ID: {oid}, Customer: {name}, Amount: {amt}, Status: {st}")
+            rows.append([oid, name, amt, st])
+        ctx = "Daily E-Commerce Order Log:\n" + "\n".join(lines)
+        inst = "Extract the order log into a structured JSON table."
+        obj = {"type": "table", "columns": ["Order ID", "Customer", "Amount", "Status"], "rows": rows}
+
+    prompt = f"Context:\n{ctx}\n\nInstruction:\n{inst}"
+    return prompt, json.dumps(obj, indent=2, ensure_ascii=False)
+
+
+def _gen_dynamic_specs_pair(rng: random.Random) -> Tuple[str, str]:
+    kind = rng.randint(0, 3)
+
+    if kind == 0:
+        # Laptop Specs Card
+        model = rng.choice(["AeroBook Pro 14", "ZenLite X16", "NovaPad Ultra", "KiranBook Air 13"])
+        cpu = rng.choice(["Intel Core Ultra 7", "AMD Ryzen 7 8840U", "Apple M3 Pro", "Intel Core i5-1340P"])
+        ram = rng.choice(["16 GB LPDDR5", "32 GB DDR5", "24 GB Unified"])
+        storage = rng.choice(["512 GB NVMe SSD", "1 TB Gen4 SSD", "2 TB NVMe SSD"])
+        price = rng.randrange(55000, 185000, 5000)
+        ctx = f"Laptop Listing: {model} powered by {cpu}, {ram} RAM, {storage}, priced at Rs {price:,}."
+        inst = "Extract the laptop specifications into a specs_card JSON."
+        obj = {
+            "type": "specs_card",
+            "data": {"Model": model, "Processor": cpu, "RAM": ram, "Storage": storage, "Price": f"Rs {price:,}"},
+        }
+    elif kind == 1:
+        # Cloud Server Specs Card
+        inst_name = rng.choice(["c7g.2xlarge", "m6i.4xlarge", "g5.xlarge", "n2-standard-8"])
+        vcpu = rng.choice([4, 8, 16, 32])
+        mem = rng.choice(["16 GB", "32 GB", "64 GB", "128 GB"])
+        region = rng.choice(["ap-south-1 (Mumbai)", "ap-south-2 (Hyderabad)", "us-east-1", "eu-central-1"])
+        cost = rng.randrange(3000, 45000, 500)
+        ctx = f"Cloud Compute Instance {inst_name}: {vcpu} vCPUs, {mem} memory, deployed in {region}, billed at Rs {cost:,}/month."
+        inst = "Extract the cloud server specifications into a specs_card JSON."
+        obj = {
+            "type": "specs_card",
+            "data": {"Instance": inst_name, "vCPU": vcpu, "Memory": mem, "Region": region, "Monthly_Cost": f"Rs {cost:,}"},
+        }
+    elif kind == 2:
+        # SaaS Plan Specs Card
+        plan = rng.choice(["Starter Plan", "Growth Plan", "Business Pro", "Enterprise Tier"])
+        users = rng.choice(["Up to 10", "Up to 50", "Up to 250", "Unlimited"])
+        api_lim = rng.choice(["50,000 req/month", "500,000 req/month", "5M req/month", "Unlimited"])
+        support = rng.choice(["Email Support", "24x7 Chat Support", "Dedicated Account Manager"])
+        price = rng.randrange(999, 25000, 500)
+        ctx = f"SaaS Subscription - {plan}: {users} users, {api_lim} API quota, {support}, at Rs {price:,} per month."
+        inst = "Extract the SaaS plan specifications into a specs_card JSON."
+        obj = {
+            "type": "specs_card",
+            "data": {"Plan": plan, "Users": users, "API_Limit": api_lim, "Support": support, "Price_Per_Month": f"Rs {price:,}"},
+        }
+    else:
+        # Home Appliance Specs Card
+        prod = rng.choice(["Split Inverter AC", "Front-Load Washing Machine", "Frost-Free Refrigerator", "RO+UV Water Purifier"])
+        brand = rng.choice(["Voltas", "LG", "Samsung", "Whirlpool", "Blue Star", "Bosch"])
+        cap = rng.choice(["1.5 Ton", "7.5 kg", "340 Litres", "10 Litres"])
+        rating = rng.choice(["3-Star BEE", "4-Star BEE", "5-Star BEE"])
+        warranty = rng.choice(["1 Year Product / 10 Years Compressor", "2 Years Comprehensive", "5 Years Motor Warranty"])
+        ctx = f"Appliance Spec: {brand} {prod}, Capacity {cap}, Energy Rating {rating}, Warranty: {warranty}."
+        inst = "Extract the appliance specifications into a specs_card JSON."
+        obj = {
+            "type": "specs_card",
+            "data": {"Product": prod, "Brand": brand, "Capacity": cap, "Energy_Rating": rating, "Warranty": warranty},
+        }
+
+    prompt = f"Context:\n{ctx}\n\nInstruction:\n{inst}"
+    return prompt, json.dumps(obj, indent=2, ensure_ascii=False)
+
+
+# =============================================================================
+# 5. Dataset Builder & ChatML Tokenization
+# =============================================================================
+
+def _format_chunks(chunks: List[Tuple[str, int, str]]) -> str:
+    return "\n\n".join(
+        f"[Chunk {idx} | Doc: {doc} | Page {page}]\n{text}"
+        for idx, (doc, page, text) in enumerate(chunks, start=1)
+    )
 
 
 def build_stage4_dataset(
-    n_raft: int = 1600,
-    n_abstain: int = 450,
-    n_greet: int = 600,
-    n_json: int = 450,
+    n_raft: int = 1200,
+    n_abstain: int = 350,
+    n_greet: int = 350,
+    n_json: int = 400,
     seed: int = 42,
 ) -> List[Tuple[str, str]]:
-    """Builds the balanced 3,100-pair Stage 4 RAFT + Conversational Fallback + JSON dataset."""
+    """Builds the balanced 2,300-pair domain-agnostic Stage 4 dataset."""
     rng = random.Random(seed)
     dataset: List[Tuple[str, str]] = []
 
-    # 1. Grounded Multi-Chunk RAFT Q&A (~1,600 pairs)
+    # 1. Domain-Agnostic Procedural RAFT Q&A (~1,200 pairs)
     for i in range(n_raft):
-        oracle = ORACLE_FACTS[i % len(ORACLE_FACTS)]
-        distractor_pool = [f for f in ORACLE_FACTS if f is not oracle]
-        distractors = rng.sample(distractor_pool, k=3)
-        chunks = [oracle] + distractors
-        rng.shuffle(chunks)
-
+        oracle_idx = i % len(DOMAIN_GENERATORS)
         use_hindi = (i % 2 == 1)
-        question = oracle["q_hi"] if use_hindi else oracle["q_en"]
-        answer = oracle["a_hi"] if use_hindi else oracle["a_en"]
+        oracle = DOMAIN_GENERATORS[oracle_idx](rng, use_hindi)
 
-        prompt = f"Retrieved Context:\n{_format_chunks(chunks)}\n\nQuestion:\n{question}"
-        dataset.append((prompt, answer))
+        # Pick 2 or 3 distractor chunks from DIFFERENT random domains
+        num_distractors = rng.choice([2, 3])
+        other_indices = [idx for idx in range(len(DOMAIN_GENERATORS)) if idx != oracle_idx]
+        picked_dist_indices = rng.sample(other_indices, k=num_distractors)
 
-    # 2. Strict Abstention on Missing Facts (~450 pairs)
+        chunk_entries: List[Tuple[str, int, str]] = [
+            (str(oracle["doc"]), int(oracle["page"]), str(oracle["text"]))
+        ]
+        for d_idx in picked_dist_indices:
+            dist = DOMAIN_GENERATORS[d_idx](rng, False)
+            chunk_entries.append((str(dist["doc"]), int(dist["page"]), str(dist["text"])))
+        rng.shuffle(chunk_entries)
+
+        prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{oracle['q']}"
+        dataset.append((prompt, str(oracle["a"])))
+
+    # 2. Clean Domain-Agnostic Abstention (~350 pairs, ZERO `[Doc: ...]` tags)
     for i in range(n_abstain):
-        question, abstention_reply = UNANSWERABLE_QUESTIONS[i % len(UNANSWERABLE_QUESTIONS)]
-        distractors = rng.sample(ORACLE_FACTS, k=3)
-        prompt = f"Retrieved Context:\n{_format_chunks(distractors)}\n\nQuestion:\n{question}"
+        question, abstention_reply = ABSTENTION_BANK[i % len(ABSTENTION_BANK)]
+        assert "[Doc:" not in abstention_reply, "Abstention replies must never contain [Doc: ...] citations"
+        picked_dist_indices = rng.sample(range(len(DOMAIN_GENERATORS)), k=3)
+        chunk_entries = []
+        for d_idx in picked_dist_indices:
+            dist = DOMAIN_GENERATORS[d_idx](rng, False)
+            chunk_entries.append((str(dist["doc"]), int(dist["page"]), str(dist["text"])))
+
+        prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{question}"
         dataset.append((prompt, abstention_reply))
 
-    # 3. Greeting & General Conversation Bypass (~600 pairs; 50% noisy context, 50% standalone)
+    # 3. Natural Bilingual Greetings & General Chat (~350 pairs; 50% noisy context, 50% standalone)
     for i in range(n_greet):
         user_msg, reply = GREETING_CONVERSATIONS[i % len(GREETING_CONVERSATIONS)]
         if i % 2 == 0:
-            # 50% wrapped inside noisy Retrieved Context chunks
-            distractors = rng.sample(ORACLE_FACTS, k=3)
-            prompt = f"Retrieved Context:\n{_format_chunks(distractors)}\n\nQuestion:\n{user_msg}"
+            picked_dist_indices = rng.sample(range(len(DOMAIN_GENERATORS)), k=rng.choice([2, 3]))
+            chunk_entries = []
+            for d_idx in picked_dist_indices:
+                dist = DOMAIN_GENERATORS[d_idx](rng, False)
+                chunk_entries.append((str(dist["doc"]), int(dist["page"]), str(dist["text"])))
+            prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{user_msg}"
         else:
-            # 50% standalone chat turns
             prompt = user_msg
         dataset.append((prompt, reply))
 
-    # 4. Structured JSON Replay Buffer (~450 pairs)
-    districts = ["Mandla", "Dindori", "Balaghat", "Bastar", "Gadchiroli", "Chhindwara"]
-    names = ["Ramesh Gond", "Sukarti Baiga", "Mangal Singh", "Kamla Devi", "Birsa Uikey", "Savitri Markam"]
-    villages = ["Bichhiya", "Mawai", "Ghughri", "Karanjia", "Baihar", "Narayanpur"]
-    statuses = ["Approved", "Pending", "Verified"]
-    packages = ["Standard Residential Package", "Premium Civic Package", "Turnkey Gram Bhawan Package"]
-    cements = ["UltraTech OPC 43 Grade Cement", "ACC PPC Blended Cement", "Shree Cement OPC 53 Grade"]
-    steels = ["Tata Tiscon Fe500D TMT Steel", "JSW Neosteel Fe500D TMT", "SAIL SeQR Fe500D Steel"]
-    wirings = ["Finolex Electrical Wiring", "Polycab FR-LSH Wiring", "Havells Flame Retardant Cables"]
-    paints = ["Asian Paints Royale finish", "Berger WeatherCoat Exterior", "Nerolac Impressions finish"]
-
+    # 4. Domain-Agnostic JSON Replay (~400 pairs)
     for i in range(n_json):
         if i % 2 == 0:
-            dist = rng.choice(districts)
-            picked_names = rng.sample(names, k=3)
-            picked_villages = rng.sample(villages, k=3)
-            areas = [f"{rng.uniform(0.8, 3.8):.2f}" for _ in range(3)]
-            sts = [rng.choice(statuses) for _ in range(3)]
-            ctx = JSON_REPLAY_TEMPLATES[0]["context"].format(
-                district=dist,
-                n1=picked_names[0], v1=picked_villages[0], a1=areas[0], s1=sts[0],
-                n2=picked_names[1], v2=picked_villages[1], a2=areas[1], s2=sts[1],
-                n3=picked_names[2], v3=picked_villages[2], a3=areas[2], s3=sts[2],
-            )
-            inst = JSON_REPLAY_TEMPLATES[0]["instruction"]
-            prompt = f"Context:\n{ctx}\n\nInstruction:\n{inst}"
-            target_obj = {
-                "type": "table",
-                "columns": ["Claimant", "Village", "Area Claimed", "Status"],
-                "rows": [
-                    [picked_names[0], picked_villages[0], f"{areas[0]} Ha", sts[0]],
-                    [picked_names[1], picked_villages[1], f"{areas[1]} Ha", sts[1]],
-                    [picked_names[2], picked_villages[2], f"{areas[2]} Ha", sts[2]],
-                ],
-            }
-            answer = json.dumps(target_obj, indent=2, ensure_ascii=False)
+            dataset.append(_gen_dynamic_table_pair(rng))
         else:
-            pkg = rng.choice(packages)
-            price = rng.choice([1450, 1650, 1850, 2100])
-            cem = rng.choice(cements)
-            stl = rng.choice(steels)
-            wir = rng.choice(wirings)
-            pnt = rng.choice(paints)
-            ctx = JSON_REPLAY_TEMPLATES[1]["context"].format(
-                pkg=pkg, price=price, cement=cem, steel=stl, wiring=wir, paint=pnt
-            )
-            inst = JSON_REPLAY_TEMPLATES[1]["instruction"]
-            prompt = f"Context:\n{ctx}\n\nInstruction:\n{inst}"
-            target_obj = {
-                "type": "specs_card",
-                "data": {
-                    "Package_Name": pkg,
-                    "Price_Per_SqFt": price,
-                    "Cement_Grade": cem,
-                    "Steel_Brand": stl,
-                    "Electrical_Wiring": wir,
-                    "Paint_Finish": pnt,
-                },
-            }
-            answer = json.dumps(target_obj, indent=2, ensure_ascii=False)
-        dataset.append((prompt, answer))
+            dataset.append(_gen_dynamic_specs_pair(rng))
 
     rng.shuffle(dataset)
     return dataset
@@ -578,7 +843,7 @@ def resolve_tokenizer(tok_arg: str) -> Path:
 
 def train_raft(args: argparse.Namespace) -> None:
     print("=" * 76)
-    print("  🚀 NORTHH DHRUVA 500M — STAGE 4 RAFT + CONVERSATIONAL FALLBACK TRAINER")
+    print("  🚀 NORTHH DHRUVA 500M — STAGE 4 DOMAIN-AGNOSTIC RAFT TRAINER")
     print("=" * 76)
 
     tok_dir = resolve_tokenizer(args.tokenizer_dir)
@@ -593,15 +858,30 @@ def train_raft(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
     dataset = RAFTChatMLDataset(pairs, tokenizer, max_seq_len=args.max_seq_len)
+    total_optim_steps = max(1, math.ceil((len(dataset) / args.batch_size) * args.epochs / args.grad_accum))
+
     print(f"  Tokenizer:     {tok_dir} (vocab={tokenizer.vocab_size:,})")
-    print(f"  Dataset Pairs: {len(dataset):,} (RAFT={args.n_raft}, Abstain={args.n_abstain}, Greet={args.n_greet}, JSON={args.n_json})")
+    print(
+        f"  Dataset Pairs: {len(dataset):,} "
+        f"(RAFT={args.n_raft}, Abstain={args.n_abstain}, Greet={args.n_greet}, JSON={args.n_json})"
+    )
+    print(
+        f"  Schedule:      epochs={args.epochs}, lr={args.lr}, batch={args.batch_size}, "
+        f"grad_accum={args.grad_accum} (~{total_optim_steps} optimizer steps)"
+    )
 
     if args.dry_run:
         sample_x, sample_y = dataset[0]
         masked_cnt = int((sample_y == -100).sum().item())
         active_cnt = int((sample_y != -100).sum().item())
+        raft_ans = [a for p, a in pairs if "Retrieved Context:" in p and "[Doc:" in a]
+        unique_citations = set(a[a.rfind("[Doc:") :] for a in raft_ans)
+        json_ans = [a for p, a in pairs if p.startswith("Context:\n") and a.startswith("{")]
+        valid_json = sum(1 for a in json_ans if isinstance(json.loads(a), dict))
         print(f"  [Dry Run] Sample 0 length={sample_x.size(0)}, masked(-100)={masked_cnt}, active_loss_tokens={active_cnt}")
-        print("  [Dry Run] Dataset & ChatML masking verified cleanly. Exiting.")
+        print(f"  [Dry Run] Unique dynamic citations in RAFT set: {len(unique_citations):,} / {len(raft_ans):,}")
+        print(f"  [Dry Run] Valid multi-domain JSON replay pairs: {valid_json:,} / {len(json_ans):,}")
+        print("  [Dry Run] Domain-agnostic RAFT dataset & ChatML masking verified cleanly. Exiting.")
         return
 
     ckpt_path = resolve_ckpt(args.ckpt)
@@ -662,9 +942,7 @@ def train_raft(args: argparse.Namespace) -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    print(f"  Epochs:        {args.epochs} | Batch: {args.batch_size} | Grad Accum: {args.grad_accum}")
     print(f"  Optimizer:     AdamW (lr={args.lr}, cosine decay, grad_clip={args.grad_clip})")
-    print(f"  Total Steps:   {total_optim_steps} optimizer steps")
     print("-" * 76)
 
     optim_step = 0
@@ -708,7 +986,7 @@ def train_raft(args: argparse.Namespace) -> None:
         {
             "config": config,
             "model_state_dict": save_sd,
-            "stage": "stage4_raft_conversational",
+            "stage": "stage4_raft_domain_agnostic",
             "raft_steps": optim_step,
             "dataset_size": len(dataset),
         },
@@ -720,23 +998,23 @@ def train_raft(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 4 RAFT + Conversational Fallback Trainer for Dhruva 500M")
+    parser = argparse.ArgumentParser(description="Stage 4 Domain-Agnostic RAFT Trainer for Dhruva 500M")
     parser.add_argument("--ckpt", type=str, default=DEFAULT_STAGE3_CKPT, help="Path to Stage 3 checkpoint")
     parser.add_argument("--output", type=str, default="dhruva_500m_raft_final.pt", help="Output Stage 4 checkpoint path")
     parser.add_argument("--tokenizer_dir", type=str, default="data/tokenizer_32k", help="32K ByteBPETokenizer directory")
-    parser.add_argument("--epochs", type=int, default=2, help="Number of fine-tuning epochs")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of fine-tuning epochs (default: 1)")
     parser.add_argument("--batch_size", type=int, default=2, help="Micro-batch size per step")
     parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1.5e-5, help="Peak AdamW learning rate")
+    parser.add_argument("--lr", type=float, default=1.0e-5, help="Peak AdamW learning rate (default: 1e-5)")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient norm clipping threshold")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Max training sequence length")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable activation gradient checkpointing")
     parser.add_argument("--log_interval", type=int, default=10, help="Logging interval in optimizer steps")
-    parser.add_argument("--n_raft", type=int, default=1600, help="Number of grounded RAFT pairs")
-    parser.add_argument("--n_abstain", type=int, default=450, help="Number of strict abstention pairs")
-    parser.add_argument("--n_greet", type=int, default=600, help="Number of greeting/bypass pairs")
-    parser.add_argument("--n_json", type=int, default=450, help="Number of JSON replay pairs")
+    parser.add_argument("--n_raft", type=int, default=1200, help="Procedural RAFT pairs across 8 domains (default: 1200)")
+    parser.add_argument("--n_abstain", type=int, default=350, help="Clean domain-agnostic abstention pairs (default: 350)")
+    parser.add_argument("--n_greet", type=int, default=350, help="Bilingual greeting/Hinglish pairs (default: 350)")
+    parser.add_argument("--n_json", type=int, default=400, help="Multi-domain JSON replay pairs (default: 400)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--dry_run", action="store_true", help="Build and validate dataset without training")
     return parser.parse_args()
