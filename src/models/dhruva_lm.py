@@ -25,8 +25,20 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.dim, eps=config.rms_norm_eps)
         self.mlp = SwiGLUMLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: Optional[tuple] = None,
+        use_cache: bool = False,
+    ):
         # Pre-norm residual connection around attention
+        if use_cache:
+            attn_out, present_kv = self.attention(
+                self.input_layernorm(x), past_kv=past_kv, use_cache=True
+            )
+            x = x + attn_out
+            x = x + self.mlp(self.post_attention_layernorm(x))
+            return x, present_kv
         x = x + self.attention(self.input_layernorm(x))
         # Pre-norm residual connection around MLP
         x = x + self.mlp(self.post_attention_layernorm(x))
@@ -45,7 +57,7 @@ class DhruvaForCausalLM(nn.Module):
     - Standalone autoregressive generation on integer token tensors.
     """
 
-    def __init__(self, config: DhruvaConfig):
+    def __init__(self, config: DhruvaConfig, init_weights: bool = True):
         super().__init__()
         self.config = config
 
@@ -61,8 +73,9 @@ class DhruvaForCausalLM(nn.Module):
         self.norm = RMSNorm(config.dim, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-        # Initialize weights
-        self._init_weights()
+        # Initialize weights (skip when loading directly from pretrained checkpoint to save CPU & RAM spike)
+        if init_weights:
+            self._init_weights()
 
         # Weight tying
         if config.tie_word_embeddings:
@@ -91,12 +104,16 @@ class DhruvaForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[list] = None,
+        use_cache: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """Forward pass operating on integer token IDs (torch.long).
 
         Args:
             input_ids: Tensor of shape (batch_size, seq_len) with dtype torch.long
             labels: Optional target token IDs of shape (batch_size, seq_len)
+            past_key_values: Optional list of (k, v) caches per layer for fast decoding
+            use_cache: Whether to return updated key/value caches
 
         Returns:
             Dictionary with "logits" (batch_size, seq_len, vocab_size) and "loss" (scalar or None)
@@ -107,9 +124,14 @@ class DhruvaForCausalLM(nn.Module):
 
         x = self.tok_embeddings(input_ids)
 
-        for layer in self.layers:
+        next_cache = [] if use_cache else None
+        for idx, layer in enumerate(self.layers):
             if self.training and getattr(self.config, "use_checkpoint", False):
                 x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            elif use_cache:
+                layer_past = past_key_values[idx] if past_key_values is not None else None
+                x, present_kv = layer(x, past_kv=layer_past, use_cache=True)
+                next_cache.append(present_kv)
             else:
                 x = layer(x)
 
@@ -123,6 +145,8 @@ class DhruvaForCausalLM(nn.Module):
             shift_labels = labels[:, 1:].contiguous().view(-1)
             loss = F.cross_entropy(shift_logits, shift_labels)
 
+        if use_cache:
+            return {"logits": logits, "loss": loss, "past_key_values": next_cache}
         return {"logits": logits, "loss": loss}
 
     @torch.no_grad()

@@ -56,17 +56,18 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
 
     def forward(
-        self, seq_len: int, device: torch.device, dtype: torch.dtype
+        self, seq_len: int, device: torch.device, dtype: torch.dtype, offset: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        total_len = offset + seq_len
         if (
             self.cos_cached is None
-            or seq_len > self.cos_cached.shape[2]
+            or total_len > self.cos_cached.shape[2]
             or self.cos_cached.device != device
         ):
-            target_len = max(seq_len, self.max_seq_len)
+            target_len = max(total_len, self.max_seq_len)
             self._build_cache(target_len)
 
         return (
-            self.cos_cached[:, :, :seq_len, :].to(dtype=dtype, device=device),
-            self.sin_cached[:, :, :seq_len, :].to(dtype=dtype, device=device),
+            self.cos_cached[:, :, offset:total_len, :].to(dtype=dtype, device=device),
+            self.sin_cached[:, :, offset:total_len, :].to(dtype=dtype, device=device),
         )

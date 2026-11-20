@@ -18,13 +18,25 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Unconditionally re-exec into project's dedicated .venv if not already inside it
+# Re-exec into project's dedicated .venv if present (POSIX only; on Windows os.execv spawns detached)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-venv_python = os.path.join(project_root, ".venv", "bin", "python")
-if os.path.isfile(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
-    os.execv(venv_python, [venv_python] + sys.argv)
+if os.name != "nt":
+    venv_python = os.path.join(project_root, ".venv", "bin", "python")
+    if os.path.isfile(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
+        os.execv(venv_python, [venv_python] + sys.argv)
 
+import gc
 import torch
+
+# Limit default CPU threads to 4 P-cores on laptops to prevent AVX2 thermal/power shutdown spikes
+_default_threads = int(os.environ.get("DHRUVA_NUM_THREADS", "4"))
+if torch.get_num_threads() > _default_threads:
+    torch.set_num_threads(_default_threads)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 # Ensure project root is in sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -50,18 +62,40 @@ def get_default_device() -> str:
 def find_available_checkpoints(search_dirs: Optional[List[str]] = None) -> List[Tuple[int, str]]:
     """Discovers all .pt checkpoints sorted by step number."""
     if search_dirs is None:
-        search_dirs = ["checkpoints_100m", "checkpoints/dhruva_t4_100m", "checkpoints"]
+        search_dirs = [
+            "../instruct_500m",
+            "../instruct_500m-20261117T050325Z-1-003/instruct_500m",
+            "instruct_500m",
+            "checkpoints_500m",
+            "checkpoints/dhruva_500m_instruct",
+            "checkpoints/dhruva_500m_base",
+            "checkpoints_100m",
+            "checkpoints/dhruva_t4_100m",
+            "checkpoints",
+        ]
 
     found: List[Tuple[int, str]] = []
+    seen_paths = set()
     for sdir in search_dirs:
-        full_dir = os.path.join(PROJECT_ROOT, sdir) if not os.path.isabs(sdir) else sdir
+        full_dir = os.path.normpath(os.path.join(PROJECT_ROOT, sdir)) if not os.path.isabs(sdir) else sdir
         if not os.path.isdir(full_dir):
             continue
         for pt_file in glob.glob(os.path.join(full_dir, "*.pt")):
+            abs_pt = os.path.abspath(pt_file)
+            if abs_pt in seen_paths:
+                continue
+            seen_paths.add(abs_pt)
             fname = os.path.basename(pt_file)
             match = re.search(r"step_(\d+)", fname)
-            step = int(match.group(1)) if match else 0
-            found.append((step, pt_file))
+            if match:
+                step = int(match.group(1))
+            elif "json" in fname.lower():
+                step = 1000000
+            elif "final" in fname.lower():
+                step = 999999
+            else:
+                step = 0
+            found.append((step, abs_pt))
 
     found.sort(key=lambda x: (x[0], x[1]))
     return found
@@ -78,17 +112,35 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> Tuple[DhruvaForCaus
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    config = ckpt.get("config", None)
-    state_dict = ckpt.get("model_state_dict", ckpt)
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    except TypeError:
+        try:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    config = ckpt.get("config", None) if isinstance(ckpt, dict) else None
+    state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
 
     if config is None:
         vocab_size, dim = state_dict["tok_embeddings.weight"].shape
-        config = DhruvaConfig.tiny_debug()
-        config.vocab_size = vocab_size
-        config.dim = dim
+        if dim == 1280:
+            config = DhruvaConfig(
+                vocab_size=vocab_size,
+                dim=1280,
+                n_layers=24,
+                n_heads=16,
+                n_kv_heads=4,
+                intermediate_size=3584,
+                max_seq_len=2048,
+            )
+        else:
+            config = DhruvaConfig.tiny_debug()
+            config.vocab_size = vocab_size
+            config.dim = dim
 
-    model = DhruvaForCausalLM(config)
+    model = DhruvaForCausalLM(config, init_weights=False)
     # Strip potential compilation prefixes if present
     cleaned_sd = {}
     for k, v in state_dict.items():
@@ -96,12 +148,30 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> Tuple[DhruvaForCaus
         cleaned_sd[clean_k] = v
 
     model.load_state_dict(cleaned_sd, strict=False)
-    model.to(device)
+    if config.tie_word_embeddings:
+        model.lm_head.weight = model.tok_embeddings.weight
+
+    step_val = "N/A"
+    sft_steps_val = None
+    last_loss_val = None
+    if isinstance(ckpt, dict):
+        step_val = ckpt.get("step", ckpt.get("sft_steps", "N/A"))
+        sft_steps_val = ckpt.get("sft_steps", None)
+        last_loss_val = ckpt.get("last_loss", None)
+
+    del cleaned_sd, state_dict, ckpt
+    gc.collect()
+
+    if device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        model.to(device=device, dtype=torch.bfloat16)
+    else:
+        model.to(device=device, dtype=torch.float32)
     model.eval()
 
     meta = {
-        "step": ckpt.get("step", "N/A"),
-        "last_loss": ckpt.get("last_loss", None),
+        "step": step_val,
+        "sft_steps": sft_steps_val,
+        "last_loss": last_loss_val,
         "config": config,
         "path": checkpoint_path,
         "params": sum(p.numel() for p in model.parameters()),
@@ -113,12 +183,13 @@ def print_banner(meta: Dict, device: str, tokenizer_vocab: int) -> None:
     print("\n" + "=" * 72)
     print("  🚀 NORTHH DHRUVA (PROJECT BHARAT-LLM) — INTERACTIVE TESTING CLI")
     print("=" * 72)
-    print(f"  Checkpoint:   {os.path.basename(meta['path'])} (Step {meta['step']})")
+    step_label = f"SFT Step {meta['sft_steps']}" if meta.get("sft_steps") is not None else f"Step {meta['step']}"
+    print(f"  Checkpoint:   {os.path.basename(meta['path'])} ({step_label})")
     if meta["last_loss"] is not None:
         print(f"  Training Loss:{meta['last_loss']:.4f}")
     print(f"  Parameters:   {meta['params']:,}")
     print(f"  Architecture: {meta['config'].n_layers}L | {meta['config'].dim}D | {meta['config'].n_heads}H / {meta['config'].n_kv_heads}KV (GQA)")
-    print(f"  Tokenizer:    16K Byte-Level BPE (Vocab: {tokenizer_vocab:,})")
+    print(f"  Tokenizer:    {tokenizer_vocab // 1024}K Byte-Level BPE (Vocab: {tokenizer_vocab:,})")
     print(f"  Device:       {device.upper()}")
     print("=" * 72)
     print("  Type your prompt and press Enter to generate.")
@@ -183,7 +254,7 @@ def run_interactive_repl(
             continue
 
         if cmd == "/clear":
-            os.system("clear")
+            os.system("cls" if os.name == "nt" else "clear")
             print_banner(current_meta, current_device, tokenizer.vocab_size)
             continue
 
@@ -298,24 +369,48 @@ def run_interactive_repl(
             run_comparison_benchmark(cmp_prompt, tokenizer, current_device, current_temp, current_top_k, current_top_p, 40)
             continue
 
-        # Normal text generation with real-time streaming
-        print("\n\033[1;32m[Dhruva]:\033[0m ", end="", flush=True)
+        # Normal text generation with SFT instruction formatting
+        user_input = prompt
         t0 = time.perf_counter()
         token_count = 0
 
         try:
-            for chunk in stream_generate_tokens(
-                model=current_model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                max_new_tokens=current_max_tokens,
-                temperature=current_temp,
-                top_k=current_top_k,
-                top_p=current_top_p,
-                device=current_device,
-            ):
-                print(chunk, end="", flush=True)
-                token_count += 1
+            # 1. User input ko instruction format mein wrap karo
+            formatted_prompt = f"### User:\n{user_input}\n\n### Assistant:\n"
+
+            # 2. Encode karo (BOS token sabse aage laga kar)
+            input_ids = [tokenizer.bos_token_id] + tokenizer.encode(formatted_prompt)
+            x = torch.tensor([input_ids], dtype=torch.long, device=current_device)
+
+            # 3. Generation loop (with KV cache for fast CPU/GPU decoding)
+            past_key_values = None
+            curr_in = x
+            with torch.no_grad():
+                for _ in range(current_max_tokens):
+                    out = current_model(curr_in, past_key_values=past_key_values, use_cache=True)
+                    logits = out["logits"][:, -1, :]
+                    past_key_values = out.get("past_key_values", None)
+
+                    # (Tumhara temperature/top_p ka sampling logic yahan aayega)
+                    if current_temp <= 0.0:
+                        next_id = torch.argmax(logits, dim=-1, keepdim=True)
+                    else:
+                        probs = torch.softmax(logits / current_temp, dim=-1)
+                        next_id = torch.multinomial(probs, num_samples=1)
+
+                    # SABSE ZAROORI: Jaise hi <eos> (ID: 2) aaye, turant break karo
+                    if next_id.item() == tokenizer.eos_token_id:
+                        break
+
+                    x = torch.cat([x, next_id], dim=-1)
+                    curr_in = next_id
+                    token_count += 1
+
+            # 4. Decode karte time prompt ko hata do, sirf answer print karo
+            generated_ids = x[0, len(input_ids):].tolist()
+            final_output = tokenizer.decode(generated_ids).strip()
+
+            print(f"\n\033[1;32m[Dhruva]:\033[0m {final_output}")
         except Exception as exc:
             print(f"\n[Generation error]: {exc}")
 
@@ -380,12 +475,12 @@ def parse_cli_args() -> argparse.Namespace:
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to .pt checkpoint file (defaults to latest in checkpoints_100m/)",
+        help="Path to .pt checkpoint file (defaults to latest discovered checkpoint)",
     )
     parser.add_argument(
         "--tokenizer_dir",
         type=str,
-        default="data/tokenizer_16k",
+        default="data/tokenizer_32k",
         help="Path to tokenizer directory containing vocab.json & merges.json",
     )
     parser.add_argument(
@@ -445,7 +540,10 @@ def main() -> None:
         sys.exit(1)
 
     # 3. Resolve Tokenizer
-    tok_dir = os.path.join(PROJECT_ROOT, args.tokenizer_dir) if not os.path.isabs(args.tokenizer_dir) else args.tokenizer_dir
+    if os.path.isdir(args.tokenizer_dir):
+        tok_dir = os.path.abspath(args.tokenizer_dir)
+    else:
+        tok_dir = os.path.join(PROJECT_ROOT, args.tokenizer_dir)
     if not os.path.isdir(tok_dir) or not os.path.isfile(os.path.join(tok_dir, "vocab.json")):
         print(f"Error: Tokenizer directory not found at '{tok_dir}'.")
         sys.exit(1)
@@ -473,23 +571,48 @@ def main() -> None:
     # 6. Mode: Single Prompt Execution
     if args.prompt is not None:
         print_banner(meta, device, tokenizer.vocab_size)
-        print(f"[Prompt]: {args.prompt}\n")
-        print("[Generated Completion]:\n", end="")
+        user_input = args.prompt
+        print(f"[Prompt]: {user_input}")
         t0 = time.perf_counter()
-        for chunk in stream_generate_tokens(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=args.prompt,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            device=device,
-        ):
-            print(chunk, end="", flush=True)
+
+        # 1. User input ko instruction format mein wrap karo
+        formatted_prompt = f"### User:\n{user_input}\n\n### Assistant:\n"
+
+        # 2. Encode karo (BOS token sabse aage laga kar)
+        input_ids = [tokenizer.bos_token_id] + tokenizer.encode(formatted_prompt)
+        x = torch.tensor([input_ids], dtype=torch.long, device=device)
+
+        # 3. Generation loop (with KV cache for fast CPU/GPU decoding)
+        past_key_values = None
+        curr_in = x
+        with torch.no_grad():
+            for _ in range(args.max_tokens):
+                out = model(curr_in, past_key_values=past_key_values, use_cache=True)
+                logits = out["logits"][:, -1, :]
+                past_key_values = out.get("past_key_values", None)
+
+                # (Tumhara temperature/top_p ka sampling logic yahan aayega)
+                if args.temperature <= 0.0:
+                    next_id = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    probs = torch.softmax(logits / args.temperature, dim=-1)
+                    next_id = torch.multinomial(probs, num_samples=1)
+
+                # SABSE ZAROORI: Jaise hi <eos> (ID: 2) aaye, turant break karo
+                if next_id.item() == tokenizer.eos_token_id:
+                    break
+
+                x = torch.cat([x, next_id], dim=-1)
+                curr_in = next_id
+
+        # 4. Decode karte time prompt ko hata do, sirf answer print karo
+        generated_ids = x[0, len(input_ids):].tolist()
+        final_output = tokenizer.decode(generated_ids).strip()
+
+        print(f"\n[Dhruva]: {final_output}")
         t1 = time.perf_counter()
         elapsed = t1 - t0
-        print(f"\n\nLatency: {elapsed * 1000.0:.2f} ms | Device: {device.upper()}\n")
+        print(f"\nLatency: {elapsed * 1000.0:.2f} ms | Device: {device.upper()}\n")
         return
 
     # 7. Mode: Interactive REPL

@@ -3,8 +3,13 @@ __pycache__/
 *.pyc
 .DS_Store
 /checkpoints/
-/data/
 northh-dhruva/checkpoints/
 northh-dhruva/data/
 checkpoints_100m/
 *.zip
+release/
+*.pt
+*.safetensors
+*.egg-info/
+build/
+dist/

@@ -39,7 +39,12 @@ class GroupedQueryAttention(nn.Module):
             )
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: Optional[ tuple ] = None,
+        use_cache: bool = False,
+    ):
         batch_size, seq_len, _ = x.shape
 
         # Reshape queries to (B, n_heads, S, head_dim) and keys/values to (B, n_kv_heads, S, head_dim)
@@ -47,18 +52,30 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to q and k
-        cos, sin = self.rope(seq_len, device=x.device, dtype=x.dtype)
+        offset = past_kv[0].shape[2] if past_kv is not None else 0
+
+        # Apply RoPE to q and k with positional offset
+        cos, sin = self.rope(seq_len, device=x.device, dtype=x.dtype, offset=offset)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        present_kv = (k, v) if use_cache else None
 
         # Expand k and v across query groups using repeat_interleave
         if self.num_key_value_groups > 1:
             k = k.repeat_interleave(self.num_key_value_groups, dim=1)
             v = v.repeat_interleave(self.num_key_value_groups, dim=1)
 
-        # Causal scaled dot-product attention
-        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Causal scaled dot-product attention (single-step decode with past_kv attends to all cached keys)
+        is_causal = (past_kv is None) and (seq_len > 1)
+        attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         # Transpose and project back to hidden dimension
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        return self.o_proj(attn_output)
+        out = self.o_proj(attn_output)
+        if use_cache:
+            return out, present_kv
+        return out

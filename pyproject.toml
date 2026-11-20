@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "northh-dhruva"
+version = "3.0.0"
+description = "Northh Dhruva 500M — Bilingual (English/Hindi) Foundation Model & Structured JSON Inference Engine"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pydantic>=2.0.0",
+    "rich>=13.0.0",
+    "pymupdf>=1.23.0",
+    "sentence-transformers>=2.6.0",
+]
+
+[project.scripts]
+dhruva = "src.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "configs*", "scripts*"]
