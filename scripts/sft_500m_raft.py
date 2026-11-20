@@ -7,17 +7,16 @@ spanning 8 everyday industries (HR, Software/API, Finance/Invoices, Legal/Contra
 Healthcare/Labs, E-commerce/Product Specs, Education/Academics, Operations/Logistics)
 in both English and Hindi/Hinglish.
 
-Anti-overfitting 2,300-pair mix (epochs=1, lr=1e-5, batch=2, grad_accum=8 -> ~144 steps):
-  1. Procedural Domain-Agnostic RAFT Q&A (~1,200 pairs): Dynamically randomized entities,
+Balanced 2,380-pair mix (epochs=3, lr=2e-5, batch=2, grad_accum=8 -> ~447 steps):
+  1. Procedural Domain-Agnostic RAFT Q&A (1,400 pairs): Dynamically randomized entities,
      numbers, dates, percentages, filenames, and page numbers (1..60) with 1 Oracle +
      2-3 cross-domain Distractors and exact inline `[Doc: {doc} | Page {page}]` citations.
-  2. Clean Domain-Agnostic Abstention (~350 pairs): Unanswerable English/Hindi questions
+  2. Clean Domain-Agnostic Abstention (180 pairs): Unanswerable English/Hindi questions
      across all 8 domains with 3 unrelated Distractors, clean period ending, ZERO `[Doc: ...]`.
-  3. Natural Bilingual Greetings & General Chat (~350 pairs): English, Hindi & Hinglish
-     greetings/identity turns (50% wrapped in noisy Retrieved Context, 50% standalone).
-  4. Domain-Agnostic JSON Replay (~400 pairs): Dynamic multi-domain `table` (employees,
-     invoices, student grades, order logs) and `specs_card` (laptops, cloud servers,
-     SaaS plans, home appliances).
+  3. Natural Bilingual Greetings & General Chat (300 pairs): 100% standalone English, Hindi
+     & Hinglish greetings/identity turns (runtime `best_cosine < 0.38` gate handles bypass).
+  4. Domain-Agnostic JSON Replay (500 pairs): Dynamic multi-domain `table` (with explicit
+     target column hints in every instruction) and `specs_card` replay.
 """
 
 import argparse
@@ -584,7 +583,7 @@ def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
             lines.append(f"{idx}. Employee: {name}, Department: {dept}, Leave Balance: {bal}, Status: {st}")
             rows.append([name, dept, bal, st])
         ctx = f"HR Roster - {rng.choice(COMPANIES)}:\n" + "\n".join(lines)
-        inst = "Extract the employee leave roster into a structured JSON table."
+        inst = "Extract the employee leave roster into a JSON table with columns: Employee, Department, Leave Balance, Status."
         obj = {"type": "table", "columns": ["Employee", "Department", "Leave Balance", "Status"], "rows": rows}
     elif kind == 1:
         # Invoice Line Items Table
@@ -598,7 +597,7 @@ def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
             lines.append(f"{idx}. Item: {item}, Quantity: {qty}, Unit Price: Rs {unit}, Total: Rs {total}")
             rows.append([item, str(qty), f"Rs {unit}", f"Rs {total}"])
         ctx = f"Invoice #{rng.randint(1000, 9999)} Summary:\n" + "\n".join(lines)
-        inst = "Extract the invoice line items into a structured JSON table."
+        inst = "Extract the invoice line items into a JSON table with columns: Item, Quantity, Unit Price, Total."
         obj = {"type": "table", "columns": ["Item", "Quantity", "Unit Price", "Total"], "rows": rows}
     elif kind == 2:
         # Student Grades Table
@@ -613,7 +612,7 @@ def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
             lines.append(f"{idx}. Student: {name}, Course: {course}, Score: {score}, Grade: {grade}")
             rows.append([name, course, score, grade])
         ctx = "Semester Grade Sheet:\n" + "\n".join(lines)
-        inst = "Extract the student grades into a structured JSON table."
+        inst = "Extract the student grades into a JSON table with columns: Student, Course, Score, Grade."
         obj = {"type": "table", "columns": ["Student", "Course", "Score", "Grade"], "rows": rows}
     else:
         # E-commerce Order Logs Table
@@ -627,7 +626,7 @@ def _gen_dynamic_table_pair(rng: random.Random) -> Tuple[str, str]:
             lines.append(f"{idx}. Order ID: {oid}, Customer: {name}, Amount: {amt}, Status: {st}")
             rows.append([oid, name, amt, st])
         ctx = "Daily E-Commerce Order Log:\n" + "\n".join(lines)
-        inst = "Extract the order log into a structured JSON table."
+        inst = "Extract the order log into a JSON table with columns: Order ID, Customer, Amount, Status."
         obj = {"type": "table", "columns": ["Order ID", "Customer", "Amount", "Status"], "rows": rows}
 
     prompt = f"Context:\n{ctx}\n\nInstruction:\n{inst}"
@@ -706,17 +705,17 @@ def _format_chunks(chunks: List[Tuple[str, int, str]]) -> str:
 
 
 def build_stage4_dataset(
-    n_raft: int = 1200,
-    n_abstain: int = 350,
-    n_greet: int = 350,
-    n_json: int = 400,
+    n_raft: int = 1400,
+    n_abstain: int = 180,
+    n_greet: int = 300,
+    n_json: int = 500,
     seed: int = 42,
 ) -> List[Tuple[str, str]]:
-    """Builds the balanced 2,300-pair domain-agnostic Stage 4 dataset."""
+    """Builds the balanced 2,380-pair domain-agnostic Stage 4 dataset."""
     rng = random.Random(seed)
     dataset: List[Tuple[str, str]] = []
 
-    # 1. Domain-Agnostic Procedural RAFT Q&A (~1,200 pairs)
+    # 1. Domain-Agnostic Procedural RAFT Q&A (1,400 pairs)
     for i in range(n_raft):
         oracle_idx = i % len(DOMAIN_GENERATORS)
         use_hindi = (i % 2 == 1)
@@ -738,7 +737,7 @@ def build_stage4_dataset(
         prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{oracle['q']}"
         dataset.append((prompt, str(oracle["a"])))
 
-    # 2. Clean Domain-Agnostic Abstention (~350 pairs, ZERO `[Doc: ...]` tags)
+    # 2. Clean Domain-Agnostic Abstention (180 pairs, ZERO `[Doc: ...]` tags)
     for i in range(n_abstain):
         question, abstention_reply = ABSTENTION_BANK[i % len(ABSTENTION_BANK)]
         assert "[Doc:" not in abstention_reply, "Abstention replies must never contain [Doc: ...] citations"
@@ -751,21 +750,12 @@ def build_stage4_dataset(
         prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{question}"
         dataset.append((prompt, abstention_reply))
 
-    # 3. Natural Bilingual Greetings & General Chat (~350 pairs; 50% noisy context, 50% standalone)
+    # 3. Natural Bilingual Greetings & General Chat (300 pairs; 100% standalone)
     for i in range(n_greet):
         user_msg, reply = GREETING_CONVERSATIONS[i % len(GREETING_CONVERSATIONS)]
-        if i % 2 == 0:
-            picked_dist_indices = rng.sample(range(len(DOMAIN_GENERATORS)), k=rng.choice([2, 3]))
-            chunk_entries = []
-            for d_idx in picked_dist_indices:
-                dist = DOMAIN_GENERATORS[d_idx](rng, False)
-                chunk_entries.append((str(dist["doc"]), int(dist["page"]), str(dist["text"])))
-            prompt = f"Retrieved Context:\n{_format_chunks(chunk_entries)}\n\nQuestion:\n{user_msg}"
-        else:
-            prompt = user_msg
-        dataset.append((prompt, reply))
+        dataset.append((user_msg, reply))
 
-    # 4. Domain-Agnostic JSON Replay (~400 pairs)
+    # 4. Domain-Agnostic JSON Replay (500 pairs)
     for i in range(n_json):
         if i % 2 == 0:
             dataset.append(_gen_dynamic_table_pair(rng))
@@ -1002,19 +992,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", type=str, default=DEFAULT_STAGE3_CKPT, help="Path to Stage 3 checkpoint")
     parser.add_argument("--output", type=str, default="dhruva_500m_raft_final.pt", help="Output Stage 4 checkpoint path")
     parser.add_argument("--tokenizer_dir", type=str, default="data/tokenizer_32k", help="32K ByteBPETokenizer directory")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of fine-tuning epochs (default: 1)")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of fine-tuning epochs (default: 3)")
     parser.add_argument("--batch_size", type=int, default=2, help="Micro-batch size per step")
     parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1.0e-5, help="Peak AdamW learning rate (default: 1e-5)")
+    parser.add_argument("--lr", type=float, default=2.0e-5, help="Peak AdamW learning rate (default: 2e-5)")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient norm clipping threshold")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Max training sequence length")
     parser.add_argument("--grad_checkpoint", action="store_true", help="Enable activation gradient checkpointing")
     parser.add_argument("--log_interval", type=int, default=10, help="Logging interval in optimizer steps")
-    parser.add_argument("--n_raft", type=int, default=1200, help="Procedural RAFT pairs across 8 domains (default: 1200)")
-    parser.add_argument("--n_abstain", type=int, default=350, help="Clean domain-agnostic abstention pairs (default: 350)")
-    parser.add_argument("--n_greet", type=int, default=350, help="Bilingual greeting/Hinglish pairs (default: 350)")
-    parser.add_argument("--n_json", type=int, default=400, help="Multi-domain JSON replay pairs (default: 400)")
+    parser.add_argument("--n_raft", type=int, default=1400, help="Procedural RAFT pairs across 8 domains (default: 1400)")
+    parser.add_argument("--n_abstain", type=int, default=180, help="Clean domain-agnostic abstention pairs (default: 180)")
+    parser.add_argument("--n_greet", type=int, default=300, help="Standalone bilingual greeting/Hinglish pairs (default: 300)")
+    parser.add_argument("--n_json", type=int, default=500, help="Multi-domain JSON replay pairs (default: 500)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--dry_run", action="store_true", help="Build and validate dataset without training")
     return parser.parse_args()
